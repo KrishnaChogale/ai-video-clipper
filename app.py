@@ -57,6 +57,7 @@ for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
+
 # ─────────────────────── SIDEBAR: DEVICE INFO & CONTROLS ───────────────────────
 with st.sidebar:
     st.header("⚙️ System & Controls")
@@ -75,22 +76,52 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("🎬 Highlight Generation")
     clip_count = st.slider("Clips to generate", 1, 20, config.CLIP_DEFAULT_COUNT)
-    clip_min = st.slider("Min duration (sec)", 10, 60, config.CLIP_MIN_DURATION, step=5)
-    clip_max = st.slider("Max duration (sec)", 15, 120, config.CLIP_MAX_DURATION, step=5)
-    if clip_min > clip_max:
-        clip_min, clip_max = clip_max, clip_min
+
+    duration_preset = st.radio(
+        "Duration Mode",
+        ["30–45s (Viral Shorts / Reels)", "Custom Duration"],
+        index=0,
+        horizontal=True,
+    )
+    if duration_preset == "30–45s (Viral Shorts / Reels)":
+        clip_min_dur = config.CLIP_VIRAL_MIN_DURATION  # 30s
+        clip_max_dur = config.CLIP_VIRAL_MAX_DURATION  # 45s
+        clip_length = config.CLIP_DEFAULT_DURATION     # 35s
+        st.caption("🎯 **Viral Sweet Spot:** 30–45s with opening 3-second hook optimization.")
+    else:
+        clip_length = st.slider(
+            "Target clip length (sec)",
+            min_value=config.CLIP_MIN_DURATION,
+            max_value=config.CLIP_MAX_DURATION,
+            value=35,
+            step=5,
+        )
+        clip_min_dur = max(15, clip_length - 5)
+        clip_max_dur = min(180, clip_length + 5)
+
+    remove_dead_air = st.checkbox(
+        "✂️ Remove Dead Air & Pauses (Jump-Cuts)",
+        value=config.REMOVE_DEAD_AIR_DEFAULT,
+        help="Cuts pauses and silent gaps >0.45s to maximize viewer retention on Shorts and Reels.",
+    )
 
     st.markdown("---")
-    st.subheader("🎞️ Aspect Ratio & Subtitles")
+    st.subheader("🎞️ Framing & Dynamic Captions")
     aspect_mode = st.radio(
         "Video Framing",
         ["9:16 Vertical (Full Screen)", "9:16 Blurred Background", "Original Aspect Ratio"],
         index=0,
     )
-    burn_captions = st.checkbox("Burn Captions (Viral Animated Subtitles)", value=True)
+    burn_captions = st.checkbox("Burn Captions (Viral Kinetic Subtitles)", value=True)
+    dynamic_highlight = st.checkbox(
+        "✨ Dynamic Word Highlighting (Reels/Shorts Pop)",
+        value=config.CAPTION_DYNAMIC_HIGHLIGHT_DEFAULT,
+        disabled=not burn_captions,
+        help="Highlights each spoken word in vibrant yellow/gold with white base text.",
+    )
     caption_position = st.selectbox(
         "Caption Placement",
-        ["Bottom (Shorts/TikTok)", "Center-Low (Podcast style)", "Top"],
+        ["Bottom (Reels/Shorts Safe Zone)", "Center-Low (Podcast style)", "Top"],
         index=0,
         disabled=not burn_captions,
     )
@@ -267,7 +298,7 @@ with tab_main:
             run_btn = False
         else:
             run_btn = st.button(
-                f"🚀 Generate {clip_count} Viral Highlights ({clip_min}–{clip_max}s each)",
+                f"✂️ Find, Cut & Caption {clip_count} Clips ({clip_length}s each)",
                 type="primary",
                 use_container_width=True,
             )
@@ -332,13 +363,13 @@ with tab_main:
                 energy_scores, visual_scores, transcript, events
             )
 
-            p4.progress(45, f"Selecting top {clip_count} highlights ({content_style} style)...")
+            p4.progress(45, f"Selecting top {clip_count} highlights ({content_style} style, {clip_min_dur}–{clip_max_dur}s)...")
             highlights = select_highlights(
                 per_sec_scores,
                 event_classification=events,
                 top_k=clip_count,
-                min_dur=clip_min,
-                max_dur=clip_max,
+                min_dur=clip_min_dur,
+                max_dur=clip_max_dur,
                 style=content_style,
             )
 
@@ -351,28 +382,39 @@ with tab_main:
                 snippet = " ".join(
                     s["text"] for s in transcript
                     if s["end"] >= h["start"] and s["start"] <= h["end"]
-                ).strip() or "(High-action GTA gameplay moment)"
+                ).strip()
                 h["transcript_snippet"] = snippet
 
-                # Titles & Hooks
-                titles = generate_titles(h, style=content_style.lower())
-                h["alt_titles"] = titles
-                h["selected_title"] = titles[0] if titles else f"GTA 6 Highlight {idx+1}"
-
-                hooks = generate_hooks(h, style=content_style.lower())
-                h["alt_hooks"] = hooks
-                h["hook"] = hooks[0] if hooks else ""
-
-                # Platform Descriptions & Hashtags
-                descs = generate_descriptions(h, title=h["selected_title"], style=content_style.lower())
-                h.update(descs)
-                h["hashtags"] = generate_hashtags(h, snippet=snippet)
+                if h.get("category") == "unknown" and not snippet:
+                    # The current local models cannot describe silent visuals.
+                    # Keep metadata factual instead of inventing a chase/crash.
+                    h["alt_titles"] = ["A GTA Moment Worth Replaying",
+                                        "Watch This GTA Scene Unfold",
+                                        "A Moment From This GTA Session"]
+                    h["selected_title"] = h["alt_titles"][0]
+                    h["alt_hooks"] = ["Watch this moment unfold",
+                                      "Here is a moment from the session",
+                                      "Take a closer look at this scene"]
+                    h["hook"] = h["alt_hooks"][0]
+                    h["hashtags"] = ["#GTA", "#GTAGameplay", "#GamingClips"]
+                    h.update({
+                        "yt_description": "A moment from this GTA session. What stood out to you?\n\n#GTA #GTAGameplay #GamingClips",
+                        "ig_description": "A moment from this GTA session 🎮 Which detail caught your eye?\n\n#GTA #GTAGameplay #GamingClips",
+                        "tt_description": "One moment from the session 🎮 What did you notice?\n#GTA #GTAGameplay #GamingClips",
+                    })
+                else:
+                    h["alt_titles"] = generate_titles(h, style=content_style.lower())
+                    h["selected_title"] = h["alt_titles"][0] if h["alt_titles"] else f"GTA Highlight {idx+1}"
+                    h["alt_hooks"] = generate_hooks(h, style=content_style.lower())
+                    h["hook"] = h["alt_hooks"][0] if h["alt_hooks"] else ""
+                    h.update(generate_descriptions(h, title=h["selected_title"], style=content_style.lower()))
+                    h["hashtags"] = generate_hashtags(h, snippet=snippet)
 
                 p4.progress(65 + int(30 * (idx + 1) / len(highlights)), f"Processed metadata for Clip {idx+1}/{len(highlights)}")
 
             st.session_state["highlights"] = highlights
             p4.progress(100, f"✅ Scored and titled {len(highlights)} clips")
-            st.success(f"Selected {len(highlights)} winning highlight moments.")
+            st.success(f"Selected {len(highlights)} moments. Cutting clips and adding captions automatically.")
         except Exception as e:
             st.error(f"Step 4 failed: {e}")
             st.stop()
@@ -410,6 +452,7 @@ with tab_main:
                     crop_vertical=is_vertical,
                     position=caption_position,
                     censor_swear_words=censor_swear,
+                    dynamic_highlight=dynamic_highlight,
                 )
                 srt_content = generate_clip_srt(
                     transcript=transcript,
@@ -419,22 +462,26 @@ with tab_main:
                 )
 
             metadata_dict = {
-                "clip_id":        clip_id,
-                "source_path":    video_path,
-                "start_sec":      h["start"],
-                "end_sec":        h["end"],
-                "duration":       h["end"] - h["start"],
-                "category":       h.get("category", content_style.lower()),
-                "score":          h.get("score", 0.0),
-                "peak_second":    h.get("peak_second"),
-                "hook":           h.get("hook", ""),
-                "alt_hooks":      h.get("alt_hooks", []),
-                "selected_title": h.get("selected_title", ""),
-                "alt_titles":     h.get("alt_titles", []),
-                "yt_description": h.get("yt_description", ""),
-                "ig_description": h.get("ig_description", ""),
-                "tt_description": h.get("tt_description", ""),
-                "hashtags":       h.get("hashtags", []),
+                "clip_id":          clip_id,
+                "source_path":      video_path,
+                "start_sec":        h["start"],
+                "end_sec":          h["end"],
+                "duration":         h["end"] - h["start"],
+                "category":         h.get("category", content_style.lower()),
+                "score":            h.get("score", 0.0),
+                "peak_second":      h.get("peak_second"),
+                "hook_score":       h.get("hook_score", 0.0),
+                "hook_type":        h.get("hook_type", "action_onset"),
+                "hook":             h.get("hook", ""),
+                "alt_hooks":        h.get("alt_hooks", []),
+                "selected_title":   h.get("selected_title", ""),
+                "alt_titles":       h.get("alt_titles", []),
+                "yt_description":   h.get("yt_description", ""),
+                "ig_description":   h.get("ig_description", ""),
+                "tt_description":   h.get("tt_description", ""),
+                "hashtags":         h.get("hashtags", []),
+                "words_list":       words_list or [],
+                "caption_position": caption_position,
             }
 
             pkg = build_clip_package(
@@ -449,6 +496,7 @@ with tab_main:
                 src_width=src_w,
                 src_height=src_h,
                 metadata=metadata_dict,
+                remove_dead_air=remove_dead_air,
             )
 
             if not pkg["success"]:
@@ -506,6 +554,13 @@ with tab_main:
                         st.image(th, caption="Suggested Cover Thumbnail", use_container_width=True)
 
                 with col_details:
+                    # Retention & Hook Metrics
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Virality Score", f"{score:.1f}")
+                    m2.metric("3s Hook Strength", f"{meta.get('hook_score', 0):.0f}%")
+                    silence_rem = meta.get("silence_removed_sec", 0.0)
+                    m3.metric("Dead Air Cut", f"{silence_rem:.1f}s" if silence_rem > 0 else "Tight")
+
                     if passed:
                         st.success("✅ Quality Check: Passed all retention & technical checks")
                     else:

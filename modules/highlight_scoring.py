@@ -1,198 +1,204 @@
-"""
-modules/highlight_scoring.py
-Multi-modal highlight scoring (0–100) with configurable weights.
-Selects non-overlapping clips and respects content-style preference.
-Supports multi-scale dynamic window durations (min_dur to max_dur).
+"""Conservative temporal highlight ranking using the project's local signals.
+
+Scores are evidence summaries, not social-platform predictions. Candidate windows
+are grown around sustained activity and corroborated event signals.
 """
 import logging
-from collections import Counter
+import sys
+import os
 
-import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
 
 
-def _normalise(values: list[float]) -> list[float]:
-    """Min-max normalise a list to [0, 1]."""
-    if not values:
-        return []
-    mn, mx = min(values), max(values)
-    if mx == mn:
-        return [0.5] * len(values)
-    return [(v - mn) / (mx - mn) for v in values]
+def _bounded(value, scale):
+    return max(0.0, min(1.0, float(value or 0.0) / scale))
 
 
-def compute_per_second_scores(
-    energy_buckets: list[dict],
-    visual_scores: list[dict],
-    transcript: list[dict],
-    event_classification: list[dict] = None,
-    weights: dict | None = None,
-) -> list[float]:
+def _evaluate_hook(per_second_scores, events, start, end, hook_window_sec=3):
     """
-    Returns a float score per second in [0, 100].
+    Evaluates viral hook strength in the first 3 seconds of a candidate window.
+    High retention on Reels/Shorts demands immediate motion, audio spike, or event trigger.
+    Returns (hook_score: float [0-100], hook_type: str).
     """
-    if weights is None:
-        weights = config.SCORE_WEIGHTS
+    hook_end = min(end, start + hook_window_sec)
+    if hook_end <= start:
+        return 0.0, "none"
 
+    hook_slice = per_second_scores[start:hook_end]
+    avg_hook_energy = sum(hook_slice) / len(hook_slice) if hook_slice else 0.0
+
+    hook_events = set()
+    for sec in range(start, min(len(events), hook_end)):
+        hook_events.update(events[sec].get("events", []))
+
+    hook_type = "action_onset"
+    bonus = 0.0
+    if any(e in hook_events for e in ["explosion", "crash", "stunt"]):
+        hook_type = "high_impact_visual"
+        bonus += 16.0
+    elif any(e in hook_events for e in ["police_chase", "gunshot"]):
+        hook_type = "police_gunfight"
+        bonus += 12.0
+    elif any(e in hook_events for e in ["npc_reaction", "high_speed"]):
+        hook_type = "speed_chaos"
+        bonus += 8.0
+
+    hook_score = min(100.0, max(0.0, avg_hook_energy * 0.85 + bonus))
+    return round(hook_score, 1), hook_type
+
+
+def compute_per_second_scores(energy_buckets, visual_scores, transcript,
+                             event_classification=None, weights=None):
+    """Score evidence with fixed saturation points; avoid per-video min/max inflation."""
     total = min(len(energy_buckets), len(visual_scores))
     if event_classification:
         total = min(total, len(event_classification))
-
-    if total == 0:
+    if not total:
         return []
-
-    # Raw signals
-    loudness = [energy_buckets[s]["loudness"]   for s in range(total)]
-    spike    = [energy_buckets[s]["spike"]       for s in range(total)]
-    visual   = [visual_scores[s]["visual_score"] for s in range(total)]
-    motion   = [visual_scores[s]["motion"]       for s in range(total)]
-    
-    if event_classification:
-        bonus = [event_classification[s].get("bonus_score", 0.0) for s in range(total)]
-    else:
-        bonus = [0.0] * total
-
-    # Build speech density
-    speech_density = [0.0] * total
-    for seg in (transcript or []):
-        wps = len(seg["text"].split()) / max(1.0, seg["end"] - seg["start"])
-        for s in range(int(seg["start"]), min(total, int(seg["end"]) + 1)):
-            speech_density[s] += wps
-
-    # Normalise each signal independently
-    n_loud   = _normalise(loudness)
-    n_spike  = _normalise(spike)
-    n_visual = _normalise(visual)
-    n_motion = _normalise(motion)
-    n_speech = _normalise(speech_density)
-    n_bonus  = _normalise(bonus)
-
-    w = weights
-    total_weight = sum(w.values()) or 100
+    speech = [0.0] * total
+    for seg in transcript or []:
+        duration = max(1.0, float(seg.get("end", 0)) - float(seg.get("start", 0)))
+        density = len(seg.get("text", "").split()) / duration
+        for sec in range(max(0, int(seg.get("start", 0))), min(total, int(seg.get("end", 0)) + 1)):
+            speech[sec] += density
 
     scores = []
-    for s in range(total):
-        # visual_action = YOLO score + motion
-        visual_action    = (n_visual[s] * 0.6 + n_motion[s] * 0.4) * 100
-        # audio_excitement = loudness + spike
-        audio_excitement = (n_loud[s] * 0.5 + n_spike[s] * 0.5) * 100
-        # unexpected_event = bonus from GTA event classifier
-        unexpected_event = n_bonus[s] * 100
-        # story_context = speech density
-        story_context    = n_speech[s] * 100
-        # event_clarity — higher when visual score is high and motion is moderate
-        event_clarity    = (n_visual[s] * 0.7 + (1.0 - abs(n_motion[s] - 0.5)) * 0.3) * 100
-        # payoff_potential — favours spikey moments
-        payoff_potential = n_spike[s] * 100
-
-        raw = (
-            visual_action    * w.get("visual_action",    25) +
-            audio_excitement * w.get("audio_excitement", 20) +
-            unexpected_event * w.get("unexpected_event", 20) +
-            story_context    * w.get("story_context",    15) +
-            event_clarity    * w.get("event_clarity",    10) +
-            payoff_potential * w.get("payoff_potential", 10)
-        ) / total_weight
-
-        scores.append(round(min(100.0, raw), 2))
-
+    for sec in range(total):
+        a, v = energy_buckets[sec], visual_scores[sec]
+        ev = event_classification[sec] if event_classification else {}
+        motion = _bounded(v.get("motion"), 45)
+        objects = _bounded(v.get("visual_score"), 8)
+        loud = _bounded(a.get("loudness"), 0.35)
+        transient = _bounded(a.get("spike"), 12)
+        speech_ctx = _bounded(speech[sec], 3)
+        corroborated = _bounded(ev.get("confidence", 0), 1)
+        # Loudness and transients have a capped 15% combined contribution.
+        factor = {
+            "event_significance": corroborated,
+            "event_clarity": min(objects, motion),
+            "visual_action": 0.55 * motion + 0.45 * objects,
+            "audio_excitement": 0.6 * loud + 0.4 * transient,
+            "unexpectedness": corroborated,
+            "build_up_payoff": _bounded(ev.get("temporal_strength", 0), 1),
+            "story_context": speech_ctx,
+            "replay_potential": 0.6 * corroborated + 0.4 * motion,
+            "video_quality": 1.0 - (0.5 if v.get("scene_change") else 0.0),
+        }
+        w = weights or config.HIGHLIGHT_FACTOR_WEIGHTS
+        factor_total = sum(max(0.0, float(w.get(k, 0))) for k in factor) or 100.0
+        score = 100.0 * sum(factor[k] * max(0.0, float(w.get(k, 0))) for k in factor) / factor_total
+        if motion < 0.12 and objects < 0.25 and corroborated < 0.3:
+            score -= 8.0  # Static footage receives an explicit boredom penalty.
+        # Save component evidence for explainable candidate ranking.
+        scores.append(round(max(0.0, min(100.0, score)), 2))
     return scores
 
 
-def select_highlights(
-    per_second_scores: list[float],
-    event_classification: list[dict] = None,
-    top_k: int = 5,
-    window_sec: int = 30,
-    min_dur: int = None,
-    max_dur: int = None,
-    min_score: float = 10.0,
-    style: str = "balanced",
-    excluded_categories: list[str] | None = None,
-) -> list[dict]:
+def select_highlights(per_second_scores, event_classification=None, top_k=5,
+                      window_sec=30, min_dur=None, max_dur=None, min_score=10.0,
+                      style="balanced", excluded_categories=None):
+    """Rank automatically generated windows around local activity peaks.
+
+    The app must cut clips without asking the user to supply timestamps. This
+    searches windows within the user's duration bounds, rewards sustained
+    activity, penalizes dead time, and greedily removes overlapping picks.
     """
-    Peak detection returning top non-overlapping highlight windows.
-    Supports fixed window_sec or dynamic range between min_dur and max_dur.
-    Returns list of dicts: {start, end, score, category, events, peak_second}
-    """
-    total = len(per_second_scores)
-    if total == 0:
+    n = len(per_second_scores)
+    if not n:
         return []
-
-    event_classification = event_classification or []
+    events = event_classification or []
+    low = max(1, int(min_dur if min_dur is not None else getattr(config, "CLIP_VIRAL_MIN_DURATION", window_sec)))
+    high = max(low, int(max_dur if max_dur is not None else getattr(config, "CLIP_VIRAL_MAX_DURATION", window_sec)))
+    max_len = min(n, high)
+    min_len = min(max_len, low)
     excluded = set(excluded_categories or [])
-    cat_map   = {e["second"]: e.get("category", "unknown") for e in event_classification}
-    event_map = {e["second"]: e.get("events", []) for e in event_classification}
-
-    # Determine candidate window sizes
-    if min_dur and max_dur and min_dur != max_dur:
-        window_sizes = sorted(list({min_dur, (min_dur + max_dur) // 2, max_dur}))
-    else:
-        window_sizes = [window_sec if not min_dur else min_dur]
-
+    baseline = sorted(per_second_scores)[int((n - 1) * 0.45)]
+    active_cutoff = max(baseline + 2.0, sorted(per_second_scores)[int((n - 1) * 0.70)])
+    # Evaluate the configured range in 5-second increments. Choosing only the
+    # minimum/midpoint/maximum made shorter windows disproportionately likely.
+    window_sizes = list(range(min_len, max_len + 1, 5))
+    if not window_sizes or window_sizes[-1] != max_len:
+        window_sizes.append(max_len)
     candidates = []
-    for w_size in window_sizes:
-        if total < w_size:
-            w_size = max(1, total)
-
-        for start in range(0, max(1, total - w_size + 1), 2): # step by 2s for efficiency
-            end = min(total, start + w_size)
-            window = per_second_scores[start:end]
-            if not window:
-                continue
-            avg_score = sum(window) / len(window)
-            peak_sec  = start + window.index(max(window))
-
-            # Style filtering modifier
-            cats_in_window = {cat_map.get(s, "unknown") for s in range(start, end)}
-            style_lower = (style or "balanced").lower()
-            if style_lower == "action" and "action" not in cats_in_window:
-                avg_score *= 0.65
-            elif style_lower == "cinematic" and "cinematic" not in cats_in_window:
-                avg_score *= 0.65
-            elif style_lower == "funny" and "funny" not in cats_in_window:
-                avg_score *= 0.65
-
-            if excluded and cats_in_window.issubset(excluded):
-                continue
-
-            dom_cat = "unknown"
-            if event_classification:
-                cats_counter = Counter(cat_map.get(s, "unknown") for s in range(start, end))
-                if cats_counter:
-                    dom_cat = cats_counter.most_common(1)[0][0]
-
-            events = list({ev for s in range(start, end) for ev in event_map.get(s, [])})
-
-            candidates.append({
-                "start":        start,
-                "end":          end,
-                "score":        round(avg_score, 2),
-                "category":     dom_cat,
-                "events":       events,
-                "peak_second":  peak_sec,
-            })
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-
-    # Greedy non-overlapping selection
-    selected = []
-    for cand in candidates:
-        if cand["score"] < min_score:
+    for length in window_sizes:
+        if length > n:
             continue
-        # Check overlap with already chosen clips
-        overlaps = any(
-            not (cand["end"] <= ch["start"] or cand["start"] >= ch["end"])
-            for ch in selected
-        )
-        if not overlaps:
-            selected.append(cand)
+        step = max(1, min(3, length // 10))
+        starts = list(range(0, n - length + 1, step))
+        if starts and starts[-1] != n - length:
+            starts.append(n - length)
+        for start in starts:
+            end = start + length
+            window = per_second_scores[start:end]
+            mean_score = sum(window) / length
+            peak = max(window)
+            coverage = sum(x >= active_cutoff for x in window) / length
+            above_baseline = sum(max(0.0, x - baseline) for x in window) / length
+            # The strongest continuous activity run estimates how much context
+            # the event needs. A 35-second developing event should not be forced
+            # into a 15-second cut just because its peak is concentrated.
+            peak_index = start + window.index(peak)
+            event_start = event_end = peak_index
+            while event_start > 0 and per_second_scores[event_start - 1] >= active_cutoff:
+                event_start -= 1
+            while event_end + 1 < n and per_second_scores[event_end + 1] >= active_cutoff:
+                event_end += 1
+            event_span = event_end - event_start + 1
+            target_length = min(max_len, max(min_len, event_span + 10))
+            duration_fit = 1.0 - abs(length - target_length) / max(1, max_len - min_len)
+            relevant = events[start:min(end, len(events))]
+            labels = {label for e in relevant for label in e.get("events", [])}
+            cat_scores = {}
+            confs = []
+            for e in relevant:
+                cat = e.get("category", "unknown")
+                cat_scores[cat] = cat_scores.get(cat, 0) + 1
+                confs.append(float(e.get("confidence", 0)))
+            category = max(cat_scores, key=cat_scores.get) if cat_scores else "unknown"
+            if category in excluded:
+                continue
+            # A peak contributes, but cannot carry a mostly inactive window.
+            quality_score = (0.58 * mean_score + 0.18 * peak + 14 * coverage +
+                             0.55 * above_baseline)
+            if quality_score < min_score:
+                continue
+
+            # Evaluate opening 3-second hook for immediate short-form viewer retention
+            hook_score, hook_type = _evaluate_hook(per_second_scores, events, start, end)
+
+            # Viral formula: 40% quality & action, 35% duration fit, 25% opening hook
+            score = 0.40 * quality_score + 0.35 * (100 * duration_fit) + 0.25 * hook_score
+            if style.lower() in {"action", "funny", "cinematic"} and category == style.lower():
+                score += 2.0
+            confidence = sum(confs) / len(confs) if confs else 0.0
+            candidates.append({"start": start, "end": end, "score": round(score, 2),
+                               "category": category, "events": sorted(labels),
+                               "peak_second": start + window.index(peak),
+                               "confidence": round(confidence, 2),
+                               "hook_score": hook_score,
+                               "hook_type": hook_type,
+                               "reason": f"Ranked with {hook_type} hook ({hook_score:.0f}%) and sustained action",
+                               "score_factors": {"window_mean": round(mean_score, 2),
+                                                 "quality_score": round(quality_score, 2),
+                                                 "hook_score": hook_score,
+                                                 "activity_coverage": round(coverage, 2),
+                                                 "peak_score": round(peak, 2),
+                                                 "target_duration": target_length,
+                                                 "duration_fit": round(duration_fit, 2),
+                                                 "event_confidence": round(confidence, 2)}})
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    selected = []
+    for c in candidates:
+        if c["score"] < min_score:
+            continue
+        if any(not (c["end"] <= x["start"] or c["start"] >= x["end"]) for x in selected):
+            continue
+        selected.append(c)
         if len(selected) >= min(top_k, config.CLIP_TOP_K_MAX):
             break
-
-    selected.sort(key=lambda x: x["start"])
-    logger.info("Highlight selection: %d clips selected", len(selected))
+    selected.sort(key=lambda c: c["start"])
+    logger.info("Temporal highlight selection: %d candidates", len(selected))
     return selected

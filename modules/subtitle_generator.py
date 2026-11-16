@@ -88,6 +88,63 @@ def format_srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
 
+def remap_words_for_dead_air(
+    words_list: list,
+    cut_intervals: list[tuple[float, float]],
+    clip_start: float,
+    clip_end: float,
+) -> list[dict]:
+    """
+    Remaps word timestamps when dead air / pauses are trimmed from the video.
+    Subtitles remain frame-accurately synchronized with the jump-cut video.
+    """
+    if not words_list:
+        return []
+
+    remapped = []
+    for w in words_list:
+        if w.get("end", 0) <= clip_start or w.get("start", 0) >= clip_end:
+            continue
+
+        orig_s = max(0.0, w["start"] - clip_start)
+        orig_e = min(clip_end - clip_start, w["end"] - clip_start)
+        if orig_e <= orig_s or not w.get("word"):
+            continue
+
+        # Calculate time removed before this word
+        removed_before_s = 0.0
+        removed_before_e = 0.0
+        word_dropped = False
+
+        for (c_start, c_end) in cut_intervals:
+            # If word is completely inside a cut interval, drop it
+            if orig_s >= c_start and orig_e <= c_end:
+                word_dropped = True
+                break
+            # Time removed before start
+            if orig_s >= c_end:
+                removed_before_s += (c_end - c_start)
+            elif orig_s > c_start:
+                removed_before_s += (orig_s - c_start)
+
+            # Time removed before end
+            if orig_e >= c_end:
+                removed_before_e += (c_end - c_start)
+            elif orig_e > c_start:
+                removed_before_e += (orig_e - c_start)
+
+        if not word_dropped:
+            new_s = max(0.0, orig_s - removed_before_s)
+            new_e = max(new_s + 0.05, orig_e - removed_before_e)
+            remapped.append({
+                "start": round(new_s, 3),
+                "end":   round(new_e, 3),
+                "word":  w["word"],
+            })
+
+    return remapped
+
+
 def generate_clip_ass(
     words_list: list = None,
     transcript: list = None,
@@ -97,19 +154,30 @@ def generate_clip_ass(
     position: str = "Bottom (Shorts/TikTok)",
     censor_swear_words: bool = True,
     max_words_per_cue: int = None,
+    dynamic_highlight: bool = True,
+    highlight_color: str = None,
 ) -> str:
     """
     Generate pixel-perfect ASS subtitles for viral shorts.
-    Supports both word-level cues and segment-level fallback.
+    Supports dynamic word-by-word kinetic highlighting (Opus Clip / CapCut style)
+    and safe zones optimized for Instagram Reels, YouTube Shorts, and TikTok.
     """
     max_words_per_cue = max_words_per_cue or config.CAPTION_MAX_WORDS_PER_CUE
+    highlight_color = highlight_color or config.CAPTION_COLOR_HIGHLIGHT
+    base_color = config.CAPTION_COLOR_BASE
     clip_words = []
 
     if words_list:
         for w in words_list:
-            if w.get("end", 0) > clip_start and w.get("start", 0) < clip_end:
-                rel_start = max(0.0, w["start"] - clip_start)
-                rel_end   = min(clip_end - clip_start, w["end"] - clip_start)
+            # If start is already relative (e.g. from remap_words_for_dead_air)
+            if "start" in w and "end" in w:
+                if w.get("end", 0) > clip_start and w.get("start", 0) < clip_end:
+                    rel_start = max(0.0, w["start"] - clip_start)
+                    rel_end   = min(clip_end - clip_start, w["end"] - clip_start)
+                else:
+                    rel_start = w["start"]
+                    rel_end   = w["end"]
+
                 if rel_end > rel_start and w.get("word"):
                     clip_words.append({"start": rel_start, "end": rel_end, "word": w["word"]})
 
@@ -143,27 +211,32 @@ def generate_clip_ass(
     if not cues:
         return ""
 
-    # Canvas & safe margin placement
+    # Canvas & safe margin placement (optimized for Reels & Shorts UI overlays)
     pos_lower = (position or "").lower()
     if crop_vertical:
-        res_x, res_y = 1080, 1920
-        fontsize = config.CAPTION_FONT_SIZE_VERTICAL
-        outline  = config.CAPTION_OUTLINE
-        shadow   = config.CAPTION_SHADOW
+        res_x, res_y = config.EXPORT_WIDTH, config.EXPORT_HEIGHT  # 1080, 1920
+        fontsize = config.CAPTION_FONT_SIZE_VERTICAL              # 68
+        outline  = config.CAPTION_OUTLINE                         # 5.0
+        shadow   = config.CAPTION_SHADOW                          # 2.0
+        margin_l = config.CAPTION_SAFE_MARGIN_H_REELS             # 80
+        margin_r = config.CAPTION_SAFE_MARGIN_H_REELS + 20        # 100 (space for right UI buttons)
+
         if "center" in pos_lower:
             alignment = 2
-            margin_v = 550
+            margin_v = 800   # Middle / Action zone
         elif "top" in pos_lower:
             alignment = 8
-            margin_v = 240
+            margin_v = 240   # Header safe zone
         else:  # Bottom
             alignment = 2
-            margin_v = 360  # Lower-third, above TikTok/Reels UI
+            margin_v = config.CAPTION_SAFE_MARGIN_V_REELS  # 440px (Safe above Reels/Shorts bottom bar)
     else:
         res_x, res_y = 1920, 1080
         fontsize = config.CAPTION_FONT_SIZE_HORIZONTAL
         outline = 3.5
-        shadow = 2
+        shadow = 2.0
+        margin_l = 40
+        margin_r = 40
         if "center" in pos_lower:
             alignment = 2
             margin_v = 220
@@ -182,22 +255,61 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ViralShorts,Arial,{fontsize},{config.CAPTION_COLOR},&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},40,40,{margin_v},1
+Style: ViralShorts,Arial,{fontsize},{base_color},&H000000FF,{config.CAPTION_COLOR_OUTLINE},&H80000000,1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},{margin_l},{margin_r},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events = []
     for cue in cues:
-        cue_start = cue[0]["start"]
-        cue_end   = max(cue[-1]["end"], cue_start + 0.4)
-        text = " ".join(item["word"] for item in cue).strip().upper()
-        if censor_swear_words:
-            text = censor_profanity(text)
-        text = text.replace("{", "(").replace("}", ")")
-        events.append(
-            f"Dialogue: 0,{format_ass_time(cue_start)},{format_ass_time(cue_end)},ViralShorts,,0,0,0,,{text}"
-        )
+        # Check if we have individual word timing in this cue
+        has_word_timing = dynamic_highlight and len(cue) > 1 and all("start" in w and "end" in w for w in cue)
+
+        if has_word_timing:
+            # Word-by-word kinetic highlighting (Karaoke style)
+            clean_words = []
+            for item in cue:
+                w_str = item["word"].strip().upper()
+                if censor_swear_words:
+                    w_str = censor_profanity(w_str)
+                w_str = w_str.replace("{", "(").replace("}", ")")
+                clean_words.append(w_str)
+
+            for j, active_item in enumerate(cue):
+                w_start = active_item["start"]
+                # Display each word until next word begins, or natural duration
+                if j < len(cue) - 1:
+                    w_end = max(w_start + 0.1, cue[j + 1]["start"])
+                else:
+                    w_end = max(active_item["end"], w_start + 0.35)
+
+                # Format current line: active word highlighted, others in base white
+                line_parts = []
+                for k, w_text in enumerate(clean_words):
+                    if k == j:
+                        line_parts.append(f"{{\\c{highlight_color}}}{w_text}{{\\c{base_color}}}")
+                    else:
+                        line_parts.append(w_text)
+
+                line_str = " ".join(line_parts)
+                events.append(
+                    f"Dialogue: 0,{format_ass_time(w_start)},{format_ass_time(w_end)},ViralShorts,,0,0,0,,{line_str}"
+                )
+        else:
+            # Fallback chunk display
+            cue_start = cue[0]["start"]
+            cue_end   = max(cue[-1]["end"], cue_start + 0.4)
+            text = " ".join(item["word"] for item in cue).strip().upper()
+            if censor_swear_words:
+                text = censor_profanity(text)
+            text = text.replace("{", "(").replace("}", ")")
+            # Apply highlight color to entire phrase if specified
+            styled_text = f"{{\\c{highlight_color}}}{text}" if highlight_color else text
+            events.append(
+                f"Dialogue: 0,{format_ass_time(cue_start)},{format_ass_time(cue_end)},ViralShorts,,0,0,0,,{styled_text}"
+            )
+
+    return header + "\n".join(events) + "\n"
 
     return header + "\n".join(events) + "\n"
 

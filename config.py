@@ -54,10 +54,18 @@ YOLO_SAMPLE_FPS = 1
 
 # ─────────────────────────── CLIP SETTINGS ───────────────────────────
 CLIP_MIN_DURATION = 15    # seconds
-CLIP_MAX_DURATION = 60    # seconds
-CLIP_DEFAULT_DURATION = 30
-CLIP_DEFAULT_COUNT = 5    # number of clips to generate
-CLIP_TOP_K_MAX = 20       # hard cap on clips per run
+CLIP_MAX_DURATION = 180   # seconds
+CLIP_VIRAL_MIN_DURATION = 30  # seconds (sweet spot for Reels/Shorts)
+CLIP_VIRAL_MAX_DURATION = 45  # seconds
+CLIP_DEFAULT_DURATION = 35    # default 35s (within 30-45s viral range)
+CLIP_DEFAULT_COUNT = 5        # number of clips to generate
+CLIP_TOP_K_MAX = 20           # hard cap on clips per run
+
+# ─────────────────────────── DEAD AIR & JUMP-CUTS ───────────────────────────
+REMOVE_DEAD_AIR_DEFAULT = True
+DEAD_AIR_MIN_PAUSE_SEC = 0.45    # Pauses longer than this are trimmed (0.45s)
+DEAD_AIR_NOISE_THRESH_DB = -32.0 # Audio silence threshold in dB
+DEAD_AIR_PAD_SEC = 0.06          # Natural breath padding on speech cuts
 
 # ─────────────────────────── HIGHLIGHT SCORING WEIGHTS ───────────────────────────
 # Must sum to 100
@@ -68,6 +76,19 @@ SCORE_WEIGHTS = {
     "story_context":    15,
     "event_clarity":    10,
     "payoff_potential": 10,
+}
+
+# Evidence factors are bounded independently so audio peaks cannot dominate.
+HIGHLIGHT_FACTOR_WEIGHTS = {
+    "event_significance": 22,
+    "event_clarity": 16,
+    "visual_action": 16,
+    "audio_excitement": 10,
+    "unexpectedness": 12,
+    "build_up_payoff": 10,
+    "story_context": 5,
+    "replay_potential": 5,
+    "video_quality": 4,
 }
 
 # ─────────────────────────── EXPORT / FFMPEG ───────────────────────────
@@ -83,12 +104,18 @@ EXPORT_AUDIO_BITRATE = "128k"
 USE_NVENC = True
 
 # ─────────────────────────── CAPTION SETTINGS ───────────────────────────
-CAPTION_FONT_SIZE_VERTICAL  = 64
+CAPTION_FONT_SIZE_VERTICAL  = 68
 CAPTION_FONT_SIZE_HORIZONTAL = 48
-CAPTION_OUTLINE = 4.5
-CAPTION_SHADOW  = 2
-CAPTION_COLOR   = "&H0000FFFF"   # yellow ASS colour
-CAPTION_MAX_WORDS_PER_CUE = 4
+CAPTION_OUTLINE = 5.0
+CAPTION_SHADOW  = 2.0
+CAPTION_COLOR_HIGHLIGHT = "&H0000FFFF&"   # Vibrant Yellow active word highlight
+CAPTION_COLOR_BASE      = "&H00FFFFFF&"   # Crisp White text
+CAPTION_COLOR_OUTLINE   = "&H00000000&"   # Jet Black outline
+CAPTION_COLOR           = "&H0000FFFF"    # Legacy yellow ASS colour
+CAPTION_MAX_WORDS_PER_CUE = 3             # 2-3 words per cue for viral kinetic pacing
+CAPTION_DYNAMIC_HIGHLIGHT_DEFAULT = True  # Word-by-word active pop
+CAPTION_SAFE_MARGIN_V_REELS = 440         # Above 350px Reels/Shorts bottom overlay
+CAPTION_SAFE_MARGIN_H_REELS = 80          # Safe from right side interaction icons
 CENSOR_PROFANITY_DEFAULT = True
 
 # ─────────────────────────── METADATA / LLM ───────────────────────────
