@@ -1,0 +1,69 @@
+# Virtual environment
+venv/
+env/
+ENV/
+.venv/
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# SENSITIVE CREDENTIALS (NEVER COMMIT)
+*cookies*
+uploaded_cookies.txt
+cookies.txt
+*.env
+.env
+.streamlit/secrets.toml
+
+# Media files, cache, and processing artifacts
+input/
+output/
+temp/
+clips/
+downloads/
+logs/
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.wav
+*.mp3
+*.aac
+*.flac
+*.ass
+*.srt
+temp_transcript.json
+
+# Database & local state
+database/*.db
+*.db
+*.sqlite
+*.sqlite3
+
+# AI weights & model checkpoints (downloaded at runtime)
+*.pt
+*.pth
+*.onnx
+*.bin
+models/*
+!models/.gitkeep
+yolo11n.pt
+yolov8n.pt
+
+# Backup files
+app_backup_*.py
+
+# System & IDE files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
