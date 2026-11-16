@@ -101,7 +101,10 @@ def test_highlight_scoring_and_selection():
 
     events = classify_events(energy_buckets, visual_scores, transcript)
     assert len(events) == 30
-    assert "action" in [e["category"] for e in events]
+    # Generic motion plus an onset spike is not enough evidence to claim an
+    # action event such as a crash, chase, or explosion.
+    assert set(e["category"] for e in events) == {"unknown"}
+    assert "possible_audio_transient" in events[10]["events"]
 
     scores = compute_per_second_scores(energy_buckets, visual_scores, transcript, events)
     assert len(scores) == 30
@@ -110,6 +113,32 @@ def test_highlight_scoring_and_selection():
     assert len(highlights) >= 1
     # Check that winning clip contains the peak region
     assert highlights[0]["start"] <= 14
+
+    # Duration limits are bounds. Sustained activity should select a longer
+    # clip than the minimum instead of defaulting every result to 15 seconds.
+    duration_scores = [5.0] * 150
+    for second in range(50, 70):
+        duration_scores[second] = 40.0
+    adaptive = select_highlights(
+        duration_scores, top_k=1, min_dur=15, max_dur=120, min_score=10.0
+    )
+    assert len(adaptive) == 1
+    assert 15 < adaptive[0]["end"] - adaptive[0]["start"] <= 120
+
+    # Clip count is independent of duration limits: 15 distinct sustained
+    # moments should produce 15 clips with adaptive lengths inside the range.
+    many_scores = [5.0] * 1600
+    for event_idx in range(15):
+        event_start = 30 + event_idx * 100
+        event_length = 15 + (event_idx % 3) * 10
+        for second in range(event_start, event_start + event_length):
+            many_scores[second] = 40.0
+    many_clips = select_highlights(
+        many_scores, top_k=15, min_dur=15, max_dur=120, min_score=10.0
+    )
+    assert len(many_clips) == 15
+    assert all(15 <= c["end"] - c["start"] <= 120 for c in many_clips)
+    assert len({c["end"] - c["start"] for c in many_clips}) > 1
 
 
 def test_title_and_hook_generation():
