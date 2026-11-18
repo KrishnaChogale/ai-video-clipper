@@ -103,51 +103,192 @@ def remux_to_mp4(src_path: str, dest_path: str) -> str:
         return src_path
 
 
+# ─────────────────────── FORMAT HELPERS ───────────────────────
+
+def format_bytes(bytes_num: float | int | None) -> str:
+    """Format bytes into human-readable string (KB, MB, GB)."""
+    if bytes_num is None or bytes_num < 0:
+        return "Unknown size"
+    bytes_float = float(bytes_num)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if bytes_float < 1024.0 or unit == "TB":
+            return f"{bytes_float:.1f} {unit}" if unit != "B" else f"{int(bytes_float)} B"
+        bytes_float /= 1024.0
+    return f"{bytes_float:.1f} GB"
+
+
+def format_seconds(seconds: float | int | None) -> str:
+    """Format seconds into HH:MM:SS or MM:SS."""
+    if seconds is None or seconds < 0:
+        return "--:--"
+    total_sec = int(seconds)
+    m, s = divmod(total_sec, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _notify_progress(callback, pct: float | None, message: str, details: dict | None = None):
+    """Safely deliver progress to callback supporting (pct, msg, details) or (pct, msg)."""
+    if callback is None:
+        return
+    try:
+        callback(pct, message, details or {})
+    except TypeError:
+        try:
+            callback(pct, message)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 # ─────────────────────── YOUTUBE DOWNLOAD ───────────────────────
 
 def download_youtube_video(
     url: str,
     output_dir: str | None = None,
     cookies_path: str | None = None,
+    browser: str | None = None,
     progress_callback=None,
 ) -> tuple[str | None, str | None]:
     """
-    Download a YouTube video using yt-dlp.
+    Download a video from YouTube or any yt-dlp supported platform.
     Returns (video_path, error_message).
-    progress_callback(pct: float, status: str) is called if provided.
+    progress_callback(pct, message, details) is called throughout download and merging.
     """
     output_dir = output_dir or config.INPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
 
     try:
         import yt_dlp
+        import time
+
+        last_update_ts = [0.0]
 
         def _progress_hook(d):
             if progress_callback is None:
                 return
-            if d.get("status") == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
+            status = d.get("status")
+            if status == "downloading":
+                now = time.time()
+                # Rate limit updates so Streamlit UI stays smooth
+                if now - last_update_ts[0] < 0.12:
+                    return
+                last_update_ts[0] = now
+
                 downloaded = d.get("downloaded_bytes", 0)
-                pct = min(downloaded / total * 100, 100)
-                progress_callback(pct, f"Downloading… {pct:.0f}%")
-            elif d.get("status") == "finished":
-                progress_callback(100, "Download complete")
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                speed = d.get("speed")
+                eta = d.get("eta")
+                frag_idx = d.get("fragment_index")
+                frag_cnt = d.get("fragment_count")
+
+                info = d.get("info_dict") or {}
+                vcodec = info.get("vcodec")
+                acodec = info.get("acodec")
+                if vcodec and vcodec != "none" and (not acodec or acodec == "none"):
+                    stream_label = "Video Track"
+                elif acodec and acodec != "none" and (not vcodec or vcodec == "none"):
+                    stream_label = "Audio Track"
+                else:
+                    stream_label = "Media"
+
+                pct = 0.0
+                if total and total > 0:
+                    pct = min(100.0, max(0.0, (downloaded / total) * 100.0))
+                elif frag_cnt and frag_cnt > 0 and frag_idx:
+                    pct = min(100.0, max(0.0, (frag_idx / frag_cnt) * 100.0))
+                else:
+                    pct = None
+
+                downloaded_str = format_bytes(downloaded)
+                total_str = format_bytes(total) if total else ("Unknown size" if not frag_cnt else f"{frag_cnt} frags")
+                speed_str = f"{format_bytes(speed)}/s" if speed else "-- KB/s"
+                eta_str = format_seconds(eta) if eta is not None else "--:--"
+
+                if total and total > 0:
+                    msg = f"📥 Downloading {stream_label}: {downloaded_str} / {total_str} ({pct:.0f}%) • {speed_str} • ETA: {eta_str}"
+                elif frag_cnt:
+                    msg = f"📥 Downloading {stream_label}: fragment {frag_idx}/{frag_cnt} • {downloaded_str} • {speed_str}"
+                else:
+                    msg = f"📥 Downloading {stream_label}: {downloaded_str} • {speed_str}"
+
+                details = {
+                    "pct": pct if pct is not None else 50.0,
+                    "status": "downloading",
+                    "stream_label": stream_label,
+                    "downloaded_bytes": downloaded,
+                    "total_bytes": total,
+                    "downloaded_str": downloaded_str,
+                    "total_str": total_str,
+                    "speed": speed,
+                    "speed_str": speed_str,
+                    "eta": eta,
+                    "eta_str": eta_str,
+                }
+                _notify_progress(progress_callback, pct if pct is not None else 50.0, msg, details)
+
+            elif status == "finished":
+                total = d.get("total_bytes") or d.get("downloaded_bytes", 0)
+                details = {
+                    "pct": 100.0,
+                    "status": "finished",
+                    "stream_label": "Media",
+                    "downloaded_bytes": total,
+                    "total_bytes": total,
+                    "downloaded_str": format_bytes(total),
+                    "total_str": format_bytes(total),
+                    "speed": None,
+                    "speed_str": "--",
+                    "eta": 0,
+                    "eta_str": "00:00",
+                }
+                msg = f"📥 Download finished ({format_bytes(total)}). Preparing media..."
+                _notify_progress(progress_callback, 100.0, msg, details)
+
+        def _postprocessor_hook(d):
+            if progress_callback is None:
+                return
+            status = d.get("status")
+            if status == "started":
+                pp_name = d.get("postprocessor", "")
+                if "Merger" in pp_name or "ffmpeg" in pp_name.lower():
+                    msg = "⚙️ Merging video & audio tracks into MP4 with FFmpeg..."
+                else:
+                    msg = f"⚙️ Finalizing media ({pp_name})..."
+                details = {
+                    "pct": 98.0,
+                    "status": "processing",
+                    "stage": msg,
+                }
+                _notify_progress(progress_callback, 98.0, msg, details)
+            elif status == "finished":
+                details = {
+                    "pct": 100.0,
+                    "status": "completed",
+                    "stage": "Media processing complete!",
+                }
+                _notify_progress(progress_callback, 100.0, "✅ Media processing complete!", details)
 
         ydl_opts = {
-            "format":           "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "outtmpl":          os.path.join(output_dir, "%(id)s_%(title)s.%(ext)s"),
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "outtmpl": os.path.join(output_dir, "%(id)s_%(title)s.%(ext)s"),
             "merge_output_format": "mp4",
-            "quiet":            True,
-            "no_warnings":      True,
-            "progress_hooks":   [_progress_hook],
-            "socket_timeout":   30,
+            "quiet": True,
+            "no_warnings": True,
+            "progress_hooks": [_progress_hook],
+            "postprocessor_hooks": [_postprocessor_hook],
+            "socket_timeout": 30,
         }
 
-        # Cookie auth
-        if cookies_path and os.path.isfile(cookies_path):
+        # Cookie auth or browser extraction
+        if browser:
+            ydl_opts["cookiesfrombrowser"] = (browser,)
+        elif cookies_path and os.path.isfile(cookies_path):
             ydl_opts["cookiefile"] = cookies_path
         else:
-            # Try default uploaded_cookies.txt location
             default_cookies = os.path.join(config.BASE_DIR, "uploaded_cookies.txt")
             if os.path.isfile(default_cookies):
                 ydl_opts["cookiefile"] = default_cookies
@@ -199,10 +340,15 @@ def identify_live_platform(url: str) -> str | None:
     return None
 
 
-def capture_live_stream_segment(url: str, duration_sec: int, output_dir: str | None = None,
-                                cookies_path: str | None = None,
-                                expected_platform: str | None = None) -> tuple[str | None, str | None]:
-    """Capture a bounded live segment from Twitch, Kick, or YouTube using yt-dlp."""
+def capture_live_stream_segment(
+    url: str,
+    duration_sec: int,
+    output_dir: str | None = None,
+    cookies_path: str | None = None,
+    expected_platform: str | None = None,
+    progress_callback=None,
+) -> tuple[str | None, str | None]:
+    """Capture a bounded live segment from Twitch, Kick, or YouTube with real-time progress."""
     output_dir = output_dir or config.INPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
     platform = identify_live_platform(url)
@@ -212,6 +358,7 @@ def capture_live_stream_segment(url: str, duration_sec: int, output_dir: str | N
         return None, f"That link is from {platform}; choose {platform} in the platform selector."
     try:
         import yt_dlp
+        import time
         from modules.clip_editor import FFMPEG_EXE
 
         duration_sec = max(30, min(int(duration_sec), 3600))
@@ -221,6 +368,8 @@ def capture_live_stream_segment(url: str, duration_sec: int, output_dir: str | N
             opts["cookiefile"] = cookies_path
         elif os.path.isfile(os.path.join(config.BASE_DIR, "uploaded_cookies.txt")):
             opts["cookiefile"] = os.path.join(config.BASE_DIR, "uploaded_cookies.txt")
+
+        _notify_progress(progress_callback, 0.0, f"🔍 Connecting to {platform} livestream...")
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -242,17 +391,96 @@ def capture_live_stream_segment(url: str, duration_sec: int, output_dir: str | N
         stream_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(info.get("id") or "live"))[:48]
         capture_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = os.path.join(output_dir, f"{stream_id}_{capture_stamp}_live_segment.mkv")
-        cmd = [FFMPEG_EXE, "-y", "-nostdin", "-loglevel", "error", "-rw_timeout", "15000000"]
+
+        cmd = [
+            FFMPEG_EXE, "-y", "-nostdin", "-loglevel", "error",
+            "-rw_timeout", "15000000",
+        ]
         if headers_arg:
             cmd += ["-headers", headers_arg]
-        cmd += ["-i", stream_url, "-t", str(duration_sec), "-map", "0:v:0", "-map", "0:a:0?",
-                "-c", "copy", "-f", "matroska", output_path]
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=duration_sec + 90)
-        if result.returncode != 0 or not os.path.isfile(output_path) or os.path.getsize(output_path) < 100_000:
-            return None, (result.stderr or "The live capture ended before enough video arrived.")[-1200:]
+        cmd += [
+            "-i", stream_url,
+            "-t", str(duration_sec),
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c", "copy",
+            "-f", "matroska",
+            "-progress", "pipe:1",
+            "-nostats",
+            output_path,
+        ]
+
+        _notify_progress(progress_callback, 1.0, f"🔴 Starting capture of {format_seconds(duration_sec)} segment...")
+
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
+
+        current_sec = 0.0
+        total_size = 0
+        speed = "1.0x"
+        last_update_ts = 0.0
+
+        if p.stdout:
+            for line in p.stdout:
+                line = line.strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    if k == "out_time_us":
+                        try:
+                            current_sec = float(v) / 1_000_000.0
+                        except Exception:
+                            pass
+                    elif k == "total_size":
+                        try:
+                            total_size = int(v) if v.isdigit() else total_size
+                        except Exception:
+                            pass
+                    elif k == "speed":
+                        speed = v.strip()
+                    elif k == "progress":
+                        now = time.time()
+                        if now - last_update_ts >= 0.25 or v == "end":
+                            last_update_ts = now
+                            pct = min(100.0, max(0.0, (current_sec / duration_sec) * 100.0))
+                            if total_size <= 0 and os.path.isfile(output_path):
+                                total_size = os.path.getsize(output_path)
+                            details = {
+                                "pct": pct,
+                                "elapsed_sec": current_sec,
+                                "target_sec": duration_sec,
+                                "elapsed_str": format_seconds(current_sec),
+                                "target_str": format_seconds(duration_sec),
+                                "size_bytes": total_size,
+                                "size_str": format_bytes(total_size),
+                                "speed": speed,
+                                "status": "recording" if v != "end" else "finished",
+                            }
+                            msg = f"🔴 Recording stream: {details['elapsed_str']} / {details['target_str']} ({pct:.0f}%) • {details['size_str']} captured • {speed}"
+                            _notify_progress(progress_callback, pct, msg, details)
+
+        p.wait(timeout=duration_sec + 90)
+        stderr_output = p.stderr.read() if p.stderr else ""
+
+        if p.returncode != 0 or not os.path.isfile(output_path) or os.path.getsize(output_path) < 100_000:
+            return None, (stderr_output or "The live capture ended before enough video arrived.")[-1200:]
+
+        final_size = os.path.getsize(output_path)
+        _notify_progress(progress_callback, 100.0, f"✅ Stream segment captured: {format_bytes(final_size)}", {
+            "pct": 100.0,
+            "status": "completed",
+            "size_str": format_bytes(final_size),
+        })
+
         return output_path, None
     except subprocess.TimeoutExpired:
+        if 'p' in locals():
+            p.kill()
         return None, "Live capture timed out. Try a shorter segment or check the stream connection."
     except Exception as e:
         return None, str(e)

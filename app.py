@@ -6,6 +6,15 @@ Run: cd C:\\ai-video-clipper && .\\venv\\Scripts\\python.exe -m streamlit run ap
 """
 import os
 import sys
+import asyncio
+
+# Safeguard for Windows asyncio IOCP buffer overflow (ValueError: buffer too large in WSASend)
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+
 import re
 import json
 import sqlite3
@@ -289,8 +298,11 @@ tab_main, tab_history, tab_performance, tab_about = st.tabs([
 with tab_main:
     st.header("Step 1 · Input Video")
 
-    # YouTube URL Input
-    youtube_url = st.text_input("🔗 Paste YouTube URL:")
+    # YouTube / Video URL Input
+    youtube_url = st.text_input(
+        "🔗 Paste Video or Stream URL (YouTube, Twitch, Kick, TikTok, X, etc.):",
+        placeholder="https://www.youtube.com/watch?v=... or Twitch / Kick / TikTok link",
+    )
 
     default_cookie_file = os.path.join(BASE_DIR, "cookies.txt")
     uploaded_cookie_file = os.path.join(BASE_DIR, "uploaded_cookies.txt")
@@ -346,16 +358,38 @@ with tab_main:
                 with open(uploaded_cookie_file, "wb") as cookie_out:
                     cookie_out.write(uploaded_cookie_obj.getbuffer())
                 capture_cookies = uploaded_cookie_file
-            with st.spinner(f"Recording {live_minutes} minutes from the live stream…"):
-                live_path, live_error = capture_live_stream_segment(
-                    live_url, live_minutes * 60, cookies_path=capture_cookies,
-                    expected_platform=live_platform,
-                )
+
+            live_bar = st.progress(0, text=f"Connecting to {live_platform} stream...")
+            live_status = st.empty()
+
+            def _on_live_prog(pct, msg, details=None):
+                val = int(max(0, min(100, pct))) if pct is not None else 0
+                live_bar.progress(val, text=msg)
+                if details and details.get("elapsed_str"):
+                    parts = [
+                        f"⏱️ **Duration:** `{details['elapsed_str']} / {details['target_str']}`",
+                        f"💾 **Captured:** `{details['size_str']}`",
+                        f"⚡ **Speed:** `{details.get('speed', '1.0x')}`",
+                    ]
+                    live_status.markdown(" &nbsp;|&nbsp; ".join(parts))
+                elif msg:
+                    live_status.info(msg)
+
+            live_path, live_error = capture_live_stream_segment(
+                live_url,
+                live_minutes * 60,
+                cookies_path=capture_cookies,
+                expected_platform=live_platform,
+                progress_callback=_on_live_prog,
+            )
+
             if live_error:
                 st.error(f"Live capture failed: {live_error}")
             else:
                 st.session_state["video_path"] = live_path
-                st.success(f"Captured live segment: `{os.path.basename(live_path)}`. You can now run the clipper.")
+                live_bar.progress(100, text="✅ Live Capture Complete!")
+                file_mb = os.path.getsize(live_path) / (1024**2)
+                live_status.success(f"Captured live segment: `{os.path.basename(live_path)}` ({file_mb:.1f} MB). You can now run the clipper.")
 
     if youtube_url and st.button("⬇️ Download Video", key="btn_yt_dl"):
         cookie_target = None
@@ -368,46 +402,47 @@ with tab_main:
                 f.write(uploaded_cookie_obj.getbuffer())
             cookie_target = uploaded_cookie_file
 
-        dl_bar = st.progress(0, "Connecting to YouTube...")
+        dl_bar = st.progress(0, text="Connecting to video source...")
+        dl_status = st.empty()
 
-        def _on_dl_prog(pct, msg):
-            dl_bar.progress(int(pct), msg)
-
-        with st.spinner("Downloading video..."):
-            if selected_browser:
-                import yt_dlp
-                try:
-                    ydl_opts = {
-                        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                        "outtmpl": os.path.join(config.INPUT_DIR, "%(id)s_%(title)s.%(ext)s"),
-                        "merge_output_format": "mp4",
-                        "quiet": True,
-                        "cookiesfrombrowser": (selected_browser,),
-                    }
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        inf = ydl.extract_info(youtube_url, download=True)
-                        f_name = ydl.prepare_filename(inf)
-                        for ext in (".mp4", ".mkv", ".webm"):
-                            c_path = os.path.splitext(f_name)[0] + ext
-                            if os.path.isfile(c_path):
-                                st.session_state["video_path"] = c_path
-                                break
-                    dl_bar.progress(100, "Download complete!")
-                    st.success("Download complete!")
-                except Exception as e:
-                    st.error(f"Browser download error: {e}")
-            else:
-                v_path, err = download_youtube_video(youtube_url, cookies_path=cookie_target, progress_callback=_on_dl_prog)
-                if err:
-                    err_l = err.lower()
-                    if "age" in err_l or "sign in" in err_l:
-                        st.error("🔒 **Age-Restricted Video:** Please supply cookies.txt or extract from browser above.")
-                    else:
-                        st.error(f"Download failed: {err}")
+        def _on_dl_prog(pct, msg, details=None):
+            val = int(max(0, min(100, pct))) if pct is not None else 0
+            dl_bar.progress(val, text=msg)
+            if details and details.get("downloaded_str"):
+                parts = []
+                if details.get("total_str") and details["total_str"] != "Unknown size":
+                    parts.append(f"📦 **Downloaded:** `{details['downloaded_str']} / {details['total_str']}`")
                 else:
-                    st.session_state["video_path"] = v_path
-                    dl_bar.progress(100, "Complete!")
-                    st.success(f"Video downloaded: `{os.path.basename(v_path)}`")
+                    parts.append(f"📦 **Downloaded:** `{details['downloaded_str']}`")
+                if details.get("speed_str"):
+                    parts.append(f"⚡ **Speed:** `{details['speed_str']}`")
+                if details.get("eta_str") and details["eta_str"] != "--:--":
+                    parts.append(f"⏳ **ETA:** `{details['eta_str']}`")
+                if details.get("stream_label"):
+                    parts.append(f"🎞️ **Track:** `{details['stream_label']}`")
+                dl_status.markdown(" &nbsp;|&nbsp; ".join(parts))
+            elif msg:
+                dl_status.info(msg)
+
+        browser_arg = selected_browser if cookie_mode == "Extract from Browser" else None
+        v_path, err = download_youtube_video(
+            youtube_url,
+            cookies_path=cookie_target,
+            browser=browser_arg,
+            progress_callback=_on_dl_prog,
+        )
+
+        if err:
+            err_l = err.lower()
+            if "age" in err_l or "sign in" in err_l:
+                st.error("🔒 **Age-Restricted Video:** Please supply cookies.txt or extract from browser above.")
+            else:
+                st.error(f"Download failed: {err}")
+        else:
+            st.session_state["video_path"] = v_path
+            dl_bar.progress(100, text="✅ Download Complete!")
+            file_mb = os.path.getsize(v_path) / (1024**2)
+            dl_status.success(f"Video downloaded: `{os.path.basename(v_path)}` ({file_mb:.1f} MB)")
 
     st.markdown("---")
 
@@ -438,16 +473,77 @@ with tab_main:
 
     # Video preview & probe info
     if video_path and os.path.isfile(video_path):
-        st.video(video_path)
+        v_meta = {}
         try:
             v_meta = probe_video(video_path)
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Duration", f"{v_meta['duration']:.0f}s ({v_meta['duration']/60:.1f}m)")
-            c2.metric("Resolution", f"{v_meta['width']}×{v_meta['height']}")
-            c3.metric("Framerate", f"{v_meta['fps']:.1f} fps")
-            c4.metric("File Size", f"{v_meta['size_bytes'] / (1024**2):.1f} MB")
+            dur = v_meta.get("duration", 0)
+            c1.metric("Duration", f"{dur:.0f}s ({dur/60:.1f}m)" if dur < 3600 else f"{dur/3600:.1f}h ({dur/60:.0f}m)")
+            c2.metric("Resolution", f"{v_meta.get('width', 0)}×{v_meta.get('height', 0)}")
+            c3.metric("Framerate", f"{v_meta.get('fps', 0):.1f} fps")
+            c4.metric("File Size", f"{v_meta.get('size_bytes', 0) / (1024**2):.1f} MB")
         except Exception:
             pass
+
+        file_size_mb = os.path.getsize(video_path) / (1024**2)
+
+        # In-browser video player safeguard:
+        # Streamlit's st.video() buffers the entire file into memory before serving it.
+        # On Windows, sending files >= 2-4 GB causes an asyncio IOCP buffer overflow
+        # (ValueError: buffer too large in WSASend) and causes high RAM usage / OOM.
+        if file_size_mb <= 250:
+            st.video(video_path)
+        else:
+            # For large files (> 250 MB), show extracted video snapshot and a lightweight 15s preview button
+            thumb_path = os.path.join(config.TEMP_DIR, f"preview_thumb_{abs(hash(video_path)) % 100000}.jpg")
+            if not os.path.isfile(thumb_path):
+                try:
+                    subprocess.run(
+                        [FFMPEG_EXE, "-ss", "5", "-i", video_path, "-vframes", "1", "-q:v", "2", "-y", thumb_path],
+                        capture_output=True, timeout=10,
+                    )
+                except Exception:
+                    pass
+
+            prev_col1, prev_col2 = st.columns([1, 1])
+            with prev_col1:
+                if os.path.isfile(thumb_path):
+                    st.image(thumb_path, caption=f"Snapshot: {os.path.basename(video_path)}", use_container_width=True)
+                else:
+                    st.info(f"📹 `{os.path.basename(video_path)}` loaded.")
+
+            with prev_col2:
+                size_label = f"{file_size_mb:.1f} MB" if file_size_mb < 1024 else f"{file_size_mb/1024:.2f} GB"
+                st.info(
+                    f"📦 **Large Source Video Loaded ({size_label}):**\n\n"
+                    f"To prevent browser freezing and Windows asyncio buffer overflow (`WSASend`), "
+                    f"full in-browser streaming is bypassed. The video is fully loaded and ready for AI processing below!"
+                )
+                sample_key = f"sample_prev_{abs(hash(video_path)) % 100000}"
+                if st.button("🎬 Play 15s Sample Preview", key=f"btn_{sample_key}"):
+                    sample_path = os.path.join(config.TEMP_DIR, f"sample_preview_{abs(hash(video_path)) % 100000}.mp4")
+                    with st.spinner("Extracting 15s sample..."):
+                        try:
+                            subprocess.run(
+                                [FFMPEG_EXE, "-ss", "5", "-i", video_path, "-t", "15", "-c", "copy", "-y", sample_path],
+                                capture_output=True, timeout=10,
+                            )
+                            if not os.path.isfile(sample_path) or os.path.getsize(sample_path) < 1000:
+                                subprocess.run(
+                                    [FFMPEG_EXE, "-ss", "5", "-i", video_path, "-t", "15", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-y", sample_path],
+                                    capture_output=True, timeout=15,
+                                )
+                            if os.path.isfile(sample_path):
+                                st.session_state[sample_key] = sample_path
+                        except Exception as e:
+                            st.warning(f"Could not extract sample preview: {e}")
+
+                if st.session_state.get(sample_key) and os.path.isfile(st.session_state[sample_key]):
+                    st.video(st.session_state[sample_key])
+
+                if file_size_mb < 1024:
+                    if st.checkbox("Force full video player (may take time to buffer)", key=f"force_full_{sample_key}"):
+                        st.video(video_path)
 
     # ── PIPELINE TRIGGER ─────────────────────────────────────────
     st.markdown("---")
@@ -930,7 +1026,24 @@ with tab_history:
             st.info("No clips recorded in the database yet. Generate clips in the first tab!")
         else:
             st.markdown(f"Found **{len(all_stored)}** clip records in `{config.DB_PATH}`:")
-            for item in all_stored:
+            CLIPS_PER_PAGE = 10
+            total_clips = len(all_stored)
+            total_pages = max(1, (total_clips + CLIPS_PER_PAGE - 1) // CLIPS_PER_PAGE)
+            if total_pages > 1:
+                page = st.selectbox(
+                    f"Page (showing {CLIPS_PER_PAGE} clips per page):",
+                    options=list(range(1, total_pages + 1)),
+                    format_func=lambda p: f"Page {p} of {total_pages} (Clips {(p-1)*CLIPS_PER_PAGE + 1}–{min(p*CLIPS_PER_PAGE, total_clips)})",
+                    key="history_page_select",
+                )
+            else:
+                page = 1
+
+            start_idx = (page - 1) * CLIPS_PER_PAGE
+            end_idx = min(start_idx + CLIPS_PER_PAGE, total_clips)
+            page_clips = all_stored[start_idx:end_idx]
+
+            for item in page_clips:
                 with st.expander(
                     f"[{item.get('category', 'clip').upper()}] {item.get('selected_title', 'Clip')} "
                     f"· Score: {item.get('score', 0):.1f} · {item.get('created_at', '')[:10]}"
