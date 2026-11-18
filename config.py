@@ -119,6 +119,16 @@ CAPTION_DYNAMIC_HIGHLIGHT_DEFAULT = True  # Word-by-word active pop
 CAPTION_SAFE_MARGIN_V_REELS = 440         # Above 350px Reels/Shorts bottom overlay
 CAPTION_SAFE_MARGIN_H_REELS = 80          # Safe from right side interaction icons
 CENSOR_PROFANITY_DEFAULT = True
+CAPTION_EMOJIS_ENABLED = True             # Auto-inject emotional/action emojis into subtitles
+
+# ─────────────────────────── HOOK TITLE BANNER ───────────────────────────
+HOOK_BANNER_ENABLED = True
+HOOK_BANNER_DURATION_SEC = 3.5            # Display hook title card during first 3.5 seconds
+HOOK_BANNER_FONT_SIZE_VERTICAL = 48
+HOOK_BANNER_FONT_SIZE_HORIZONTAL = 36
+HOOK_BANNER_STYLE = "pill"                # "pill" (translucent black banner) | "outline" (heavy stroke)
+HOOK_BANNER_MARGIN_V_VERTICAL = 260       # Safe top margin in 1080x1920 (above center gameplay)
+HOOK_BANNER_MARGIN_V_HORIZONTAL = 70
 
 # ─────────────────────────── METADATA / LLM ───────────────────────────
 OLLAMA_MODEL = "llama3.2"

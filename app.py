@@ -205,6 +205,17 @@ with st.sidebar:
         value=True,
         disabled=not burn_captions,
     )
+    burn_hook_header = st.checkbox(
+        "🪝 Burn On-Screen Hook Title (First 3.5s)",
+        value=True,
+        help="Burns the opening viral hook as a bold title banner at the top of the video to stop viewers from scrolling.",
+    )
+    enable_caption_emojis = st.checkbox(
+        "🔥 Dynamic Subtitle Emojis",
+        value=True,
+        disabled=not burn_captions,
+        help="Automatically injects context emojis (🔥, 💀, 🚗, 🚨, 🎯) into subtitle phrases.",
+    )
     caption_style_overrides = {
         "fontsize_vertical": caption_font_size,
         "fontsize_horizontal": max(18, round(caption_font_size * 0.7)),
@@ -604,13 +615,14 @@ with tab_main:
                 f"Exporting clip {i+1}/{len(highlights)}: {h['selected_title'][:35]}...",
             )
 
-            # Subtitles
+            # Subtitles & On-Screen Hook Banner
             ass_content = None
             srt_content = None
-            if burn_captions and transcript:
+            hook_banner_text = (h.get("hook") or h.get("selected_title") or "").strip()
+            if (burn_captions and transcript) or (burn_hook_header and hook_banner_text):
                 ass_content = generate_clip_ass(
                     words_list=words_list or [],
-                    transcript=transcript,
+                    transcript=transcript if burn_captions else None,
                     clip_start=h["start"],
                     clip_end=h["end"],
                     crop_vertical=is_vertical,
@@ -618,7 +630,11 @@ with tab_main:
                     censor_swear_words=censor_swear,
                     dynamic_highlight=dynamic_highlight,
                     caption_style=caption_style,
+                    hook_text=hook_banner_text,
+                    burn_hook=burn_hook_header,
+                    add_emojis=enable_caption_emojis,
                 )
+            if burn_captions and transcript:
                 srt_content = generate_clip_srt(
                     transcript=transcript,
                     clip_start=h["start"],
@@ -651,10 +667,12 @@ with tab_main:
                 "transcript":       transcript or [],
                 "caption_position": caption_position,
                 "caption_template": caption_template_name,
-                "caption_style": caption_style,
-                "export_settings": export_settings,
-                "crop_style": crop_style_choice,
-                "remove_dead_air": remove_dead_air,
+                "caption_style":    caption_style,
+                "burn_hook":        burn_hook_header,
+                "add_emojis":       enable_caption_emojis,
+                "export_settings":  export_settings,
+                "crop_style":       crop_style_choice,
+                "remove_dead_air":  remove_dead_air,
             }
 
             pkg = build_clip_package(
@@ -774,6 +792,9 @@ with tab_main:
                                     "duration": float(clip_end_edit - clip_start_edit),
                                     "clip_id": f"{meta.get('clip_id', f'clip_{idx+1:02d}')}_edit",
                                 })
+                                edited_hook = edited_meta.get("hook") or edited_meta.get("selected_title")
+                                edited_burn_hook = edited_meta.get("burn_hook", True)
+                                edited_emojis = edited_meta.get("add_emojis", True)
                                 edited_ass = generate_clip_ass(
                                     words_list=edited_meta.get("words_list", []),
                                     transcript=edited_meta.get("transcript", []),
@@ -782,7 +803,10 @@ with tab_main:
                                                        > (edited_meta.get("export_settings") or {}).get("width", 1080)),
                                     position=edited_meta.get("caption_position", "Bottom (Shorts/TikTok)"),
                                     caption_style=edited_meta.get("caption_style"),
-                                ) if edited_meta.get("words_list") or edited_meta.get("transcript") else None
+                                    hook_text=edited_hook,
+                                    burn_hook=edited_burn_hook,
+                                    add_emojis=edited_emojis,
+                                ) if (edited_meta.get("words_list") or edited_meta.get("transcript") or (edited_burn_hook and edited_hook)) else None
                                 edited_srt = generate_clip_srt(
                                     edited_meta.get("transcript", []), clip_start_edit, clip_end_edit
                                 ) if edited_meta.get("transcript") else None

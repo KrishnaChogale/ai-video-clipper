@@ -60,6 +60,61 @@ PROFANITY_MAP = {
     r"\bnigga\b":         "N*GGA",
 }
 
+# ─────────────────────── DYNAMIC SUBTITLE EMOJIS ───────────────────────
+EMOJI_KEYWORD_MAP = {
+    r"\b(crazy|insane|wild|unreal|fire|lit|heat|hype|cracked|clutch)\b": "🔥",
+    r"\b(dead|die|died|killing|killed|kill|rip|ded|rekt|busted|wasted)\b": "💀",
+    r"\b(car|cars|drive|driving|speed|drift|drifting|race|racing|vehicle|whip)\b": "🚗",
+    r"\b(cop|cops|police|feds|siren|sirens|wanted|arrested|escape|escaping)\b": "🚨",
+    r"\b(shoot|shot|gun|guns|weapon|sniper|bullet|bullets|aim)\b": "🎯",
+    r"\b(boom|explode|explosion|bomb|blast|crash|crashed|smash|hit)\b": "💥",
+    r"\b(money|cash|rich|bank|heist|dollar|dollars|pay|paid|rich|bag)\b": "💰",
+    r"\b(lol|lmao|haha|hahaha|funny|joke|laughing|laugh)\b": "😂",
+    r"\b(omg|wow|what|bro|dude|wait|shocked|look)\b": "😱",
+    r"\b(win|won|goat|king|god|legend)\b": "👑",
+}
+
+
+def detect_cue_emoji(text: str) -> str:
+    """Detect matching context emoji for subtitle phrases based on gaming/action keywords."""
+    for pattern, emoji in EMOJI_KEYWORD_MAP.items():
+        if re.search(pattern, text, re.IGNORECASE):
+            return emoji
+    return ""
+
+
+def wrap_hook_text(text: str, max_chars_per_line: int = 24) -> str:
+    """Wrap hook text onto 2-3 lines using ASS \\N tag."""
+    words = text.strip().split()
+    if not words:
+        return ""
+    lines = []
+    current_line = []
+    current_len = 0
+    for w in words:
+        if current_len + len(w) + 1 > max_chars_per_line and current_line:
+            lines.append(" ".join(current_line))
+            current_line = [w]
+            current_len = len(w)
+        else:
+            current_line.append(w)
+            current_len += len(w) + 1
+    if current_line:
+        lines.append(" ".join(current_line))
+    return r"\N".join(lines)
+
+
+def format_hook_ass_text(text: str) -> str:
+    """Format hook title text with yellow highlight on lead words and white on remainder."""
+    clean = text.strip().upper().replace("{", "(").replace("}", ")")
+    words = clean.split()
+    if len(words) <= 2:
+        return r"{\c&H0000FFFF&}" + clean
+    lead = " ".join(words[:2])
+    rest = " ".join(words[2:])
+    wrapped_rest = wrap_hook_text(rest, max_chars_per_line=24)
+    return r"{\c&H0000FFFF&}" + lead + r" {\c&H00FFFFFF&}" + wrapped_rest
+
 
 def censor_profanity(text: str) -> str:
     """Replace profanity using PROFANITY_MAP (case-insensitive regex)."""
@@ -157,10 +212,16 @@ def generate_clip_ass(
     dynamic_highlight: bool = True,
     highlight_color: str = None,
     caption_style: dict | None = None,
+    hook_text: str | None = None,
+    hook_duration: float = None,
+    burn_hook: bool = None,
+    add_emojis: bool = None,
+    hook_style: str = None,
 ) -> str:
     """
     Generate pixel-perfect ASS subtitles for viral shorts.
-    Supports dynamic word-by-word kinetic highlighting (Opus Clip / CapCut style)
+    Supports dynamic word-by-word kinetic highlighting (Opus Clip / CapCut style),
+    context-aware emoji triggers, top hook title banners,
     and safe zones optimized for Instagram Reels, YouTube Shorts, and TikTok.
     """
     style = caption_style or {}
@@ -168,6 +229,10 @@ def generate_clip_ass(
     dynamic_highlight = bool(style.get("dynamic_highlight", dynamic_highlight))
     highlight_color = highlight_color or style.get("highlight_color") or config.CAPTION_COLOR_HIGHLIGHT
     base_color = style.get("base_color") or config.CAPTION_COLOR_BASE
+    burn_hook = getattr(config, "HOOK_BANNER_ENABLED", True) if burn_hook is None else bool(burn_hook)
+    add_emojis = getattr(config, "CAPTION_EMOJIS_ENABLED", True) if add_emojis is None else bool(add_emojis)
+    hook_duration = float(hook_duration or getattr(config, "HOOK_BANNER_DURATION_SEC", 3.5))
+    hook_style = str(hook_style or getattr(config, "HOOK_BANNER_STYLE", "pill")).lower()
     clip_words = []
 
     if words_list:
@@ -211,7 +276,7 @@ def generate_clip_ass(
                     c_end   = min(rel_end, rel_start + ((i + len(chunk)) / wps))
                     cues.append([{"start": c_start, "end": c_end, "word": " ".join(chunk)}])
 
-    if not cues:
+    if not cues and not (burn_hook and hook_text):
         return ""
 
     # Canvas & safe margin placement (optimized for Reels & Shorts UI overlays)
@@ -233,6 +298,9 @@ def generate_clip_ass(
         else:  # Bottom
             alignment = 2
             margin_v = config.CAPTION_SAFE_MARGIN_V_REELS  # 440px (Safe above Reels/Shorts bottom bar)
+
+        hook_fontsize = getattr(config, "HOOK_BANNER_FONT_SIZE_VERTICAL", 48)
+        hook_margin_v = getattr(config, "HOOK_BANNER_MARGIN_V_VERTICAL", 260)
     else:
         res_x, res_y = 1920, 1080
         fontsize = style.get("fontsize_horizontal", config.CAPTION_FONT_SIZE_HORIZONTAL)
@@ -250,6 +318,9 @@ def generate_clip_ass(
             alignment = 2
             margin_v = 100
 
+        hook_fontsize = getattr(config, "HOOK_BANNER_FONT_SIZE_HORIZONTAL", 36)
+        hook_margin_v = getattr(config, "HOOK_BANNER_MARGIN_V_HORIZONTAL", 70)
+
     fontname = str(style.get("fontname", "Arial"))
     if not re.fullmatch(r"[A-Za-z0-9 _-]{1,40}", fontname):
         fontname = "Arial"
@@ -257,6 +328,14 @@ def generate_clip_ass(
     outline_color = style.get("outline_color", config.CAPTION_COLOR_OUTLINE)
     back_color = style.get("back_color", "&H80000000&")
     border_style = int(style.get("border_style", 1))
+
+    # Hook banner style definition (Pill box vs Bold Outline)
+    if hook_style == "outline":
+        hook_style_def = f"Style: HookBanner,Arial Black,{hook_fontsize},&H00FFFFFF,&H000000FF,&H00000000,&H90000000,-1,0,0,0,100,100,2,0,1,6,3,8,60,60,{hook_margin_v},1"
+    else:
+        # Default "pill": Translucent rounded box
+        hook_style_def = f"Style: HookBanner,Arial Black,{hook_fontsize},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,1,0,3,14,0,8,60,60,{hook_margin_v},1"
+
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {res_x}
@@ -266,12 +345,30 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: ViralShorts,{fontname},{fontsize},{base_color},&H000000FF,{outline_color},{back_color},{bold},0,0,0,100,100,0,0,{border_style},{outline},{shadow},{alignment},{margin_l},{margin_r},{margin_v},1
+{hook_style_def}
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events = []
+
+    # 1. On-Screen Hook Title Banner Dialogue (Layer 1, displayed for first hook_duration seconds)
+    if burn_hook and hook_text:
+        hook_end = min(max(0.5, clip_end - clip_start), hook_duration)
+        if hook_end > 0.4:
+            styled_hook = format_hook_ass_text(hook_text)
+            events.append(
+                f"Dialogue: 1,0:00:00.00,{format_ass_time(hook_end)},HookBanner,,0,0,0,,{{\\fad(100,250)}}{styled_hook}"
+            )
+
+    # 2. Dynamic Kinetic Subtitles
     for cue in cues:
+        # Check if we should inject context emoji for this cue
+        cue_full_text = " ".join(item["word"] for item in cue)
+        detected_emoji = detect_cue_emoji(cue_full_text) if add_emojis else ""
+        has_existing_emoji = any(char in cue_full_text for char in ["🔥", "💀", "🚗", "🚨", "🎯", "💥", "💰", "😂", "😱", "👑"])
+        cue_emoji = detected_emoji if (detected_emoji and not has_existing_emoji) else ""
+
         # Check if we have individual word timing in this cue
         has_word_timing = dynamic_highlight and len(cue) > 1 and all("start" in w and "end" in w for w in cue)
 
@@ -284,6 +381,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     w_str = censor_profanity(w_str)
                 w_str = w_str.replace("{", "(").replace("}", ")")
                 clean_words.append(w_str)
+
+            # Append emoji to the final word of the cue
+            if cue_emoji and clean_words:
+                clean_words[-1] = f"{clean_words[-1]} {cue_emoji}"
 
             for j, active_item in enumerate(cue):
                 w_start = active_item["start"]
@@ -313,13 +414,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             if censor_swear_words:
                 text = censor_profanity(text)
             text = text.replace("{", "(").replace("}", ")")
+            if cue_emoji:
+                text = f"{text} {cue_emoji}"
             # Apply highlight color to entire phrase if specified
             styled_text = f"{{\\c{highlight_color}}}{text}" if highlight_color else text
             events.append(
                 f"Dialogue: 0,{format_ass_time(cue_start)},{format_ass_time(cue_end)},ViralShorts,,0,0,0,,{styled_text}"
             )
-
-    return header + "\n".join(events) + "\n"
 
     return header + "\n".join(events) + "\n"
 

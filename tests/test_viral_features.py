@@ -110,6 +110,47 @@ class TestViralFeatures(unittest.TestCase):
         self.assertIn("D*MN", censored)
         self.assertIn("SH*TTY", censored)
 
+    def test_hook_title_banner_and_emojis(self):
+        from modules.subtitle_generator import detect_cue_emoji, wrap_hook_text, format_hook_ass_text
+
+        # 1. Emoji detection
+        self.assertEqual(detect_cue_emoji("That drift was crazy!"), "🔥")
+        self.assertEqual(detect_cue_emoji("The police are here!"), "🚨")
+        self.assertEqual(detect_cue_emoji("We totally died"), "💀")
+        self.assertEqual(detect_cue_emoji("He blew up with a bomb"), "💥")
+
+        # 2. Hook text formatting and wrapping
+        wrapped = wrap_hook_text("YOU NEED TO SEE THIS CRAZY FIVE STAR POLICE ESCAPE", max_chars_per_line=24)
+        self.assertIn(r"\N", wrapped)
+
+        formatted = format_hook_ass_text("YOU NEED TO SEE THIS 🔥")
+        self.assertIn(r"{\c&H0000FFFF&}YOU NEED", formatted)
+        self.assertIn(r"{\c&H00FFFFFF&}TO SEE THIS 🔥", formatted)
+
+        # 3. ASS generation with hook banner & subtitle emojis
+        words = [
+            {"start": 0.5, "end": 1.0, "word": "That"},
+            {"start": 1.0, "end": 1.5, "word": "was"},
+            {"start": 1.5, "end": 2.2, "word": "crazy"},
+        ]
+        ass = generate_clip_ass(
+            words_list=words,
+            clip_start=0.0,
+            clip_end=10.0,
+            crop_vertical=True,
+            hook_text="YOU NEED TO SEE THIS 🔥",
+            burn_hook=True,
+            add_emojis=True,
+        )
+
+        # Hook style and dialogue presence
+        self.assertIn("Style: HookBanner", ass)
+        self.assertIn("HookBanner,,0,0,0,,{\\fad(", ass)
+        self.assertIn("YOU NEED", ass)
+
+        # Dynamic cue emoji injection
+        self.assertIn("🔥", ass)
+
 
 if __name__ == "__main__":
     unittest.main()

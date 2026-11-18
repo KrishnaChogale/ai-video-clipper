@@ -429,6 +429,9 @@ def build_clip_package(
             remapped_words = remap_words_for_dead_air(words_list, cut_intervals, start_sec, end_sec)
             pos = metadata.get("caption_position", "Bottom (Shorts/TikTok)") if metadata else "Bottom (Shorts/TikTok)"
             style = metadata.get("caption_style") if metadata else None
+            hook_text = (metadata or {}).get("hook") or (metadata or {}).get("selected_title")
+            burn_hook = (metadata or {}).get("burn_hook", getattr(config, "HOOK_BANNER_ENABLED", True))
+            add_emojis = (metadata or {}).get("add_emojis", getattr(config, "CAPTION_EMOJIS_ENABLED", True))
             ass_content = generate_clip_ass(
                 words_list=remapped_words,
                 clip_start=0.0,
@@ -438,6 +441,9 @@ def build_clip_package(
                 censor_swear_words=True,
                 dynamic_highlight=bool((style or {}).get("dynamic_highlight", True)),
                 caption_style=style,
+                hook_text=hook_text,
+                burn_hook=burn_hook,
+                add_emojis=add_emojis,
             )
 
     # 2. Write ASS & SRT files
