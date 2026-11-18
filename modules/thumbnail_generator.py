@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 import cv2
 import numpy as np
+import textwrap
 
 
 def _frame_quality(frame: np.ndarray) -> tuple[float, float]:
@@ -23,7 +24,9 @@ def extract_thumbnail(
     peak_second: float | None = None,
     min_sharpness: float = 100.0,
     min_brightness: float = 40.0,
-    sample_every_n_frames: int = 15,
+    sample_every_n_frames: int = 8,
+    title: str = "",
+    prefer_faces: bool = False,
 ) -> str | None:
     """
     Extract the best-quality frame from a video file and save as JPEG.
@@ -53,6 +56,18 @@ def extract_thumbnail(
 
     best_frame = None
     best_score = -1.0
+    # OpenCV 5 removed the legacy Haar CascadeClassifier API. Face preference
+    # should improve ranking when available, but must never break clip export.
+    face_cascade = None
+    cascade_cls = getattr(cv2, "CascadeClassifier", None)
+    haar_data = getattr(getattr(cv2, "data", None), "haarcascades", None)
+    if prefer_faces and cascade_cls is not None and haar_data:
+        try:
+            candidate = cascade_cls(haar_data + "haarcascade_frontalface_default.xml")
+            if not candidate.empty():
+                face_cascade = candidate
+        except Exception:
+            face_cascade = None
 
     # Bonus for being near peak_second
     peak_frame = int(peak_second * fps) if peak_second is not None else -1
@@ -74,12 +89,22 @@ def extract_thumbnail(
         if lap_var < min_sharpness or brightness < min_brightness:
             continue
 
-        # Score = sharpness + brightness bonus + proximity bonus
+        # Balance detail, usable exposure, peak timing, and (when relevant) a face.
+        exposure_score = max(0.0, 35.0 - abs(brightness - 135.0) * 0.35)
         proximity_bonus = 0.0
         if peak_frame > 0:
-            proximity_bonus = max(0.0, 200.0 - abs(frame_idx - peak_frame) * 0.5)
+            proximity_bonus = max(0.0, 24.0 - abs(frame_idx - peak_frame) / max(1.0, fps * 1.5))
 
-        score = lap_var + brightness * 0.5 + proximity_bonus
+        face_bonus = 0.0
+        if face_cascade is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.12,
+                                                  minNeighbors=5, minSize=(36, 36))
+            if len(faces):
+                face_bonus = min(30.0, max(w * h for _, _, w, h in faces) /
+                                 max(1.0, frame.shape[0] * frame.shape[1]) * 120)
+
+        score = min(100.0, np.log1p(lap_var) * 8.0) + exposure_score + proximity_bonus + face_bonus
 
         if score > best_score:
             best_score = score
@@ -96,9 +121,39 @@ def extract_thumbnail(
         if not ret or best_frame is None:
             return None
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    cv2.imwrite(output_path, best_frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if title:
+        best_frame = _draw_title(best_frame, title)
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    cv2.imwrite(output_path, best_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
     return output_path
+
+
+def _draw_title(frame: np.ndarray, title: str) -> np.ndarray:
+    """Add a readable, high-contrast cover title without obscuring most of the frame."""
+    image = frame.copy()
+    height, width = image.shape[:2]
+    text = title.encode("ascii", "replace").decode("ascii").strip()
+    max_chars = max(16, min(34, width // 24))
+    lines = textwrap.wrap(text, width=max_chars)[:2]
+    if not lines:
+        return image
+    font = cv2.FONT_HERSHEY_DUPLEX
+    scale = max(0.55, min(1.2, width / 1000.0))
+    thickness = max(1, int(scale * 2.5))
+    line_h = int(38 * scale)
+    pad = int(22 * scale)
+    band_h = min(height, line_h * len(lines) + pad * 2)
+    overlay = image.copy()
+    cv2.rectangle(overlay, (0, height - band_h), (width, height), (0, 0, 0), -1)
+    image = cv2.addWeighted(overlay, 0.68, image, 0.32, 0)
+    y = height - band_h + pad + line_h
+    for line in lines:
+        cv2.putText(image, line, (pad, y), font, scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+        cv2.putText(image, line, (pad, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        y += line_h
+    return image
 
 
 def extract_thumbnail_at_second(video_path: str, second: float, output_path: str) -> str | None:

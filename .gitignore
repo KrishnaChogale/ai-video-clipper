@@ -40,6 +40,10 @@ logs/
 *.flac
 *.ass
 *.srt
+*.zip
+*.tar*
+*.gz
+*.7z
 temp_transcript.json
 
 # Database & local state

@@ -146,6 +146,21 @@ def detect_dead_air(
         else:
             merged_cuts.append([s, e])
 
+    # Prefer a few genuinely long pauses over cutting every word-level gap.
+    # Keep at most roughly two cuts per 30 seconds, spaced away from each other.
+    max_cuts = max(1, int((clip_dur + 14.999) // 15))
+    ranked_cuts = sorted(merged_cuts, key=lambda interval: interval[1] - interval[0], reverse=True)
+    selected_cuts = []
+    min_between = float(getattr(config, "DEAD_AIR_MIN_KEEP_BETWEEN_CUTS_SEC", 5.0))
+    for interval in ranked_cuts:
+        if any(max(0.0, max(interval[0], chosen[0]) - min(interval[1], chosen[1])) < min_between
+               for chosen in selected_cuts):
+            continue
+        selected_cuts.append(interval)
+        if len(selected_cuts) >= max_cuts:
+            break
+    merged_cuts = sorted(selected_cuts, key=lambda interval: interval[0])
+
     # 4. Generate keep intervals
     keep_intervals = []
     cur = 0.0
@@ -183,6 +198,7 @@ def cut_clip(
     src_width: int = 0,
     src_height: int = 0,
     keep_intervals: list[tuple[float, float]] | None = None,
+    export_settings: dict | None = None,
 ) -> tuple[bool, str]:
     """
     Cut a clip from source_path using FFmpeg.
@@ -191,8 +207,9 @@ def cut_clip(
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     duration = max(1.0, float(end_sec - start_sec))
-    out_w = config.EXPORT_WIDTH   # 1080
-    out_h = config.EXPORT_HEIGHT  # 1920
+    export_settings = export_settings or {}
+    out_w = int(export_settings.get("width", config.EXPORT_WIDTH))
+    out_h = int(export_settings.get("height", config.EXPORT_HEIGHT))
 
     # Case A: Jump-cuts (Multiple keep intervals after dead-air removal)
     if keep_intervals and len(keep_intervals) > 1:
@@ -221,6 +238,10 @@ def cut_clip(
                     f"[fg]scale={out_w}:-2[fg_s];"
                     f"[bg_b][fg_s]overlay=(W-w)/2:(H-h)/2[v_framed]"
                 )
+            elif crop_style == "face":
+                from modules.face_tracker import face_crop_x_expression
+                face_x = face_crop_x_expression(source_path, start_sec, end_sec)
+                f_parts.append(f"[v_cat]crop=ih*9/16:ih:{face_x or '(iw-ow)/2'},scale={out_w}:{out_h},setsar=1[v_framed]")
             else:
                 f_parts.append(f"[v_cat]crop=ih*9/16:ih,scale={out_w}:{out_h},setsar=1[v_framed]")
         else:
@@ -242,7 +263,7 @@ def cut_clip(
             "-map", out_v_tag,
             "-map", "[a_cat]",
         ]
-        return _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path, vertical, crop_style, src_width, src_height, keep_intervals)
+        return _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path, vertical, crop_style, src_width, src_height, keep_intervals, export_settings)
 
     # Case B: Standard single-segment cut
     filters = []
@@ -271,9 +292,17 @@ def cut_clip(
                 "-map", video_map,
                 "-map", "0:a?",
             ]
-            return _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path, vertical, "center", src_width, src_height)
+            return _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path, vertical, "center", src_width, src_height, export_settings=export_settings)
         else:
-            filters.append(f"crop=ih*9/16:ih,scale={out_w}:{out_h},setsar=1")
+            if crop_style == "face":
+                from modules.face_tracker import face_crop_x_expression
+                face_x = face_crop_x_expression(source_path, start_sec, end_sec)
+                filters.append(f"crop=ih*9/16:ih:{face_x or '(iw-ow)/2'},scale={out_w}:{out_h},setsar=1")
+            else:
+                filters.append(f"crop=ih*9/16:ih,scale={out_w}:{out_h},setsar=1")
+
+    if not vertical:
+        filters.append(f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,setsar=1")
 
     if ass_path and os.path.isfile(ass_path):
         ass_escaped = os.path.abspath(ass_path).replace("\\", "/").replace(":", "\\:")
@@ -289,20 +318,32 @@ def cut_clip(
         cmd += ["-vf", ",".join(filters)]
 
     cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
-    return _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path, vertical, crop_style, src_width, src_height)
+    return _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path, vertical, crop_style, src_width, src_height, export_settings=export_settings)
 
 
-def _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path, vertical, crop_style, src_width, src_height, keep_intervals=None):
+def _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path, vertical, crop_style, src_width, src_height, keep_intervals=None, export_settings=None):
+    export_settings = export_settings or {}
     use_hw = _use_nvenc()
-    codec_args = (
-        ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", str(config.EXPORT_CRF)]
-        if use_hw else
-        ["-c:v", "libx264", "-preset", config.EXPORT_PRESET, "-crf", str(config.EXPORT_CRF)]
-    )
+    codec = str(export_settings.get("codec", "h264")).lower()
+    quality = int(export_settings.get("quality", config.EXPORT_CRF))
+    fps = int(export_settings.get("fps", config.EXPORT_FPS))
+    audio_bitrate = str(export_settings.get("audio_bitrate", config.EXPORT_AUDIO_BITRATE))
+    nvenc_name = "hevc_nvenc" if codec in {"h265", "hevc"} else "h264_nvenc"
+    cpu_name = "libx265" if codec in {"h265", "hevc"} else "libx264"
+    if use_hw and codec in {"h265", "hevc"}:
+        try:
+            probe = subprocess.run([FFMPEG_EXE, "-y", "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+                                    "-c:v", nvenc_name, "-f", "null", "-"],
+                                   capture_output=True, text=True, timeout=5)
+            use_hw = probe.returncode == 0
+        except Exception:
+            use_hw = False
+    codec_args = (["-c:v", nvenc_name, "-preset", "p4", "-cq", str(quality)] if use_hw
+                  else ["-c:v", cpu_name, "-preset", config.EXPORT_PRESET, "-crf", str(quality)])
 
     full_cmd = cmd + codec_args + [
-        "-r", str(config.EXPORT_FPS),
-        "-c:a", "aac", "-b:a", config.EXPORT_AUDIO_BITRATE, "-ar", "44100",
+        "-r", str(fps),
+        "-c:a", "aac", "-b:a", audio_bitrate, "-ar", "44100",
         output_path
     ]
 
@@ -314,7 +355,7 @@ def _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path,
                 logger.warning("NVENC failed, retrying on libx264: %s", res.stderr[-500:])
                 global _NVENC_AVAILABLE
                 _NVENC_AVAILABLE = False
-                return cut_clip(source_path, start_sec, end_sec, output_path, ass_path, vertical, crop_style, src_width, src_height, keep_intervals=keep_intervals)
+                return cut_clip(source_path, start_sec, end_sec, output_path, ass_path, vertical, crop_style, src_width, src_height, keep_intervals=keep_intervals, export_settings=export_settings)
             return False, f"FFmpeg error:\n{res.stderr[-2000:]}"
         return True, output_path
     except subprocess.TimeoutExpired:
@@ -337,6 +378,7 @@ def build_clip_package(
     metadata: dict | None = None,
     output_root: str | None = None,
     remove_dead_air: bool = True,
+    export_settings: dict | None = None,
 ) -> dict:
     """
     Build complete export package for a single clip:
@@ -386,6 +428,7 @@ def build_clip_package(
             from modules.subtitle_generator import remap_words_for_dead_air, generate_clip_ass
             remapped_words = remap_words_for_dead_air(words_list, cut_intervals, start_sec, end_sec)
             pos = metadata.get("caption_position", "Bottom (Shorts/TikTok)") if metadata else "Bottom (Shorts/TikTok)"
+            style = metadata.get("caption_style") if metadata else None
             ass_content = generate_clip_ass(
                 words_list=remapped_words,
                 clip_start=0.0,
@@ -393,7 +436,8 @@ def build_clip_package(
                 crop_vertical=vertical,
                 position=pos,
                 censor_swear_words=True,
-                dynamic_highlight=True,
+                dynamic_highlight=bool((style or {}).get("dynamic_highlight", True)),
+                caption_style=style,
             )
 
     # 2. Write ASS & SRT files
@@ -417,6 +461,7 @@ def build_clip_package(
         ass_path=ass_path, vertical=vertical, crop_style=crop_style,
         src_width=src_width, src_height=src_height,
         keep_intervals=keep_intervals,
+        export_settings=export_settings,
     )
 
     if not success:
@@ -429,8 +474,12 @@ def build_clip_package(
     # 4. Extract thumbnail
     from modules.thumbnail_generator import extract_thumbnail
     thumb_path = os.path.join(pkg_dir, "thumbnail.jpg")
-    peak = metadata.get("peak_second") if metadata else None
-    thumb = extract_thumbnail(clip_path, thumb_path, peak_second=peak)
+    peak = (metadata.get("peak_second") - start_sec) if metadata and metadata.get("peak_second") is not None else None
+    thumb = extract_thumbnail(
+        clip_path, thumb_path, peak_second=peak,
+        title=(metadata or {}).get("selected_title", ""),
+        prefer_faces=True,
+    )
     result["thumbnail_path"] = thumb
 
     # 5. Text files & metadata.json

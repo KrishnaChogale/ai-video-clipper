@@ -86,6 +86,7 @@ def compute_per_second_scores(energy_buckets, visual_scores, transcript,
             "story_context": speech_ctx,
             "replay_potential": 0.6 * corroborated + 0.4 * motion,
             "video_quality": 1.0 - (0.5 if v.get("scene_change") else 0.0),
+            "visual_beauty": _bounded(v.get("scenic_visual_score"), 100),
         }
         w = weights or config.HIGHLIGHT_FACTOR_WEIGHTS
         factor_total = sum(max(0.0, float(w.get(k, 0))) for k in factor) or 100.0
@@ -173,6 +174,8 @@ def select_highlights(per_second_scores, event_classification=None, top_k=5,
             score = 0.40 * quality_score + 0.35 * (100 * duration_fit) + 0.25 * hook_score
             if style.lower() in {"action", "funny", "cinematic"} and category == style.lower():
                 score += 2.0
+            if style.lower().replace(" ", "_") in {"scenic", "scenic_showcase"} and category == "scenic":
+                score += 10.0
             confidence = sum(confs) / len(confs) if confs else 0.0
             candidates.append({"start": start, "end": end, "score": round(score, 2),
                                "category": category, "events": sorted(labels),

@@ -156,15 +156,18 @@ def generate_clip_ass(
     max_words_per_cue: int = None,
     dynamic_highlight: bool = True,
     highlight_color: str = None,
+    caption_style: dict | None = None,
 ) -> str:
     """
     Generate pixel-perfect ASS subtitles for viral shorts.
     Supports dynamic word-by-word kinetic highlighting (Opus Clip / CapCut style)
     and safe zones optimized for Instagram Reels, YouTube Shorts, and TikTok.
     """
-    max_words_per_cue = max_words_per_cue or config.CAPTION_MAX_WORDS_PER_CUE
-    highlight_color = highlight_color or config.CAPTION_COLOR_HIGHLIGHT
-    base_color = config.CAPTION_COLOR_BASE
+    style = caption_style or {}
+    max_words_per_cue = max_words_per_cue or style.get("max_words_per_cue") or config.CAPTION_MAX_WORDS_PER_CUE
+    dynamic_highlight = bool(style.get("dynamic_highlight", dynamic_highlight))
+    highlight_color = highlight_color or style.get("highlight_color") or config.CAPTION_COLOR_HIGHLIGHT
+    base_color = style.get("base_color") or config.CAPTION_COLOR_BASE
     clip_words = []
 
     if words_list:
@@ -215,9 +218,9 @@ def generate_clip_ass(
     pos_lower = (position or "").lower()
     if crop_vertical:
         res_x, res_y = config.EXPORT_WIDTH, config.EXPORT_HEIGHT  # 1080, 1920
-        fontsize = config.CAPTION_FONT_SIZE_VERTICAL              # 68
-        outline  = config.CAPTION_OUTLINE                         # 5.0
-        shadow   = config.CAPTION_SHADOW                          # 2.0
+        fontsize = style.get("fontsize_vertical", config.CAPTION_FONT_SIZE_VERTICAL)
+        outline  = style.get("outline", config.CAPTION_OUTLINE)
+        shadow   = style.get("shadow", config.CAPTION_SHADOW)
         margin_l = config.CAPTION_SAFE_MARGIN_H_REELS             # 80
         margin_r = config.CAPTION_SAFE_MARGIN_H_REELS + 20        # 100 (space for right UI buttons)
 
@@ -232,9 +235,9 @@ def generate_clip_ass(
             margin_v = config.CAPTION_SAFE_MARGIN_V_REELS  # 440px (Safe above Reels/Shorts bottom bar)
     else:
         res_x, res_y = 1920, 1080
-        fontsize = config.CAPTION_FONT_SIZE_HORIZONTAL
-        outline = 3.5
-        shadow = 2.0
+        fontsize = style.get("fontsize_horizontal", config.CAPTION_FONT_SIZE_HORIZONTAL)
+        outline = style.get("outline", 3.5)
+        shadow = style.get("shadow", 2.0)
         margin_l = 40
         margin_r = 40
         if "center" in pos_lower:
@@ -247,6 +250,13 @@ def generate_clip_ass(
             alignment = 2
             margin_v = 100
 
+    fontname = str(style.get("fontname", "Arial"))
+    if not re.fullmatch(r"[A-Za-z0-9 _-]{1,40}", fontname):
+        fontname = "Arial"
+    bold = -1 if style.get("bold", True) else 0
+    outline_color = style.get("outline_color", config.CAPTION_COLOR_OUTLINE)
+    back_color = style.get("back_color", "&H80000000&")
+    border_style = int(style.get("border_style", 1))
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {res_x}
@@ -255,7 +265,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ViralShorts,Arial,{fontsize},{base_color},&H000000FF,{config.CAPTION_COLOR_OUTLINE},&H80000000,1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},{margin_l},{margin_r},{margin_v},1
+Style: ViralShorts,{fontname},{fontsize},{base_color},&H000000FF,{outline_color},{back_color},{bold},0,0,0,100,100,0,0,{border_style},{outline},{shadow},{alignment},{margin_l},{margin_r},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text

@@ -102,3 +102,9 @@ ai-video-clipper/
 
 ## 📄 License
 MIT License. Free for personal and commercial use.
+
+## Caption and Export Controls
+
+The caption panel provides six built-in presets, immediate style preview, font and color controls, text sizing, outline and shadow controls, and local custom-template save/reset. Word-level Whisper timestamps drive burned captions. Export profiles support Shorts, Reels, TikTok, and 16:9 YouTube, with configurable FPS, H.264/H.265, quality, and audio bitrate. NVENC is selected only after an FFmpeg capability probe; CPU encoding remains the fallback.
+
+Transcript excerpts and manual clip start/end edits are available on generated clips. Applying a trim re-renders that clip and runs the existing quality checks. These controls do not yet provide transcript word correction, drag editing, split/merge operations, or speaker labels.

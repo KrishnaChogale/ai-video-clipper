@@ -9,6 +9,8 @@ import subprocess
 import json
 import shutil
 import re
+from urllib.parse import urlparse
+from datetime import datetime
 
 
 # ─────────────────────── FFPROBE ───────────────────────
@@ -175,6 +177,83 @@ def download_youtube_video(
 
             return None, "Downloaded file not found"
 
+    except Exception as e:
+        return None, str(e)
+
+
+def identify_live_platform(url: str) -> str | None:
+    """Return the supported live platform for a Twitch, Kick, or YouTube URL."""
+    try:
+        parsed = urlparse((url or "").strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except Exception:
+        return None
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if host == "twitch.tv" or host.endswith(".twitch.tv"):
+        return "Twitch"
+    if host == "kick.com" or host.endswith(".kick.com"):
+        return "Kick"
+    if host in {"youtube.com", "youtu.be", "youtube-nocookie.com"} or host.endswith(".youtube.com"):
+        return "YouTube Live"
+    return None
+
+
+def capture_live_stream_segment(url: str, duration_sec: int, output_dir: str | None = None,
+                                cookies_path: str | None = None,
+                                expected_platform: str | None = None) -> tuple[str | None, str | None]:
+    """Capture a bounded live segment from Twitch, Kick, or YouTube using yt-dlp."""
+    output_dir = output_dir or config.INPUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+    platform = identify_live_platform(url)
+    if platform is None:
+        return None, "Use a Twitch, Kick, or YouTube Live channel/stream URL."
+    if expected_platform and platform != expected_platform:
+        return None, f"That link is from {platform}; choose {platform} in the platform selector."
+    try:
+        import yt_dlp
+        from modules.clip_editor import FFMPEG_EXE
+
+        duration_sec = max(30, min(int(duration_sec), 3600))
+        opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+                "socket_timeout": 30, "live_from_start": False}
+        if cookies_path and os.path.isfile(cookies_path):
+            opts["cookiefile"] = cookies_path
+        elif os.path.isfile(os.path.join(config.BASE_DIR, "uploaded_cookies.txt")):
+            opts["cookiefile"] = os.path.join(config.BASE_DIR, "uploaded_cookies.txt")
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        live_status = info.get("live_status")
+        is_live = info.get("is_live") is True or live_status == "is_live"
+        if not is_live:
+            if live_status == "is_upcoming":
+                return None, "This stream is scheduled but not live yet. Try again after it starts."
+            return None, f"No active {platform} livestream was found at this URL. Check that the channel is live."
+        formats = [f for f in info.get("formats", []) if f.get("url") and f.get("vcodec") != "none"]
+        if not formats and info.get("url"):
+            formats = [info]
+        if not formats:
+            return None, "Could not find a playable live video stream for this URL."
+        video = max(formats, key=lambda f: (f.get("acodec") != "none", f.get("height") or 0, f.get("tbr") or 0))
+        stream_url = video.get("url")
+        headers = video.get("http_headers") or info.get("http_headers") or {}
+        headers_arg = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
+        stream_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(info.get("id") or "live"))[:48]
+        capture_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(output_dir, f"{stream_id}_{capture_stamp}_live_segment.mkv")
+        cmd = [FFMPEG_EXE, "-y", "-nostdin", "-loglevel", "error", "-rw_timeout", "15000000"]
+        if headers_arg:
+            cmd += ["-headers", headers_arg]
+        cmd += ["-i", stream_url, "-t", str(duration_sec), "-map", "0:v:0", "-map", "0:a:0?",
+                "-c", "copy", "-f", "matroska", output_path]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=duration_sec + 90)
+        if result.returncode != 0 or not os.path.isfile(output_path) or os.path.getsize(output_path) < 100_000:
+            return None, (result.stderr or "The live capture ended before enough video arrived.")[-1200:]
+        return output_path, None
+    except subprocess.TimeoutExpired:
+        return None, "Live capture timed out. Try a shorter segment or check the stream connection."
     except Exception as e:
         return None, str(e)
 

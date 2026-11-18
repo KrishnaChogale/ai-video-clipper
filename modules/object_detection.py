@@ -71,6 +71,16 @@ def _is_scene_change(prev_frame, curr_frame, threshold=35.0) -> bool:
     return float(np.mean(diff)) > threshold
 
 
+def _scenic_visual_score(frame) -> float:
+    """Estimate clean, colorful showcase frames from saturation and exposure cues."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    saturation = float(np.mean(hsv[:, :, 1]))
+    brightness = float(np.mean(hsv[:, :, 2]))
+    color_score = min(100.0, saturation * 1.35)
+    exposure_score = max(0.0, 100.0 - abs(brightness - 135.0) * 1.1)
+    return round(0.55 * color_score + 0.45 * exposure_score, 2)
+
+
 def _extract_frames_ffmpeg(video_path: str, fps: int = 1, width: int = 640, height: int = 360):
     """Fast frame extraction using FFmpeg pipe scaled directly in C."""
     cmd = [
@@ -134,6 +144,7 @@ def analyze_visuals(
                 "visual_score":  round(det_score, 2),
                 "motion":        round(motion, 2),
                 "scene_change":  scene_ch,
+                "scenic_visual_score": _scenic_visual_score(small),
             })
 
             prev_sampled = small
@@ -180,6 +191,7 @@ def analyze_visuals(
                 "visual_score":  round(det_score, 2),
                 "motion":        round(motion, 2),
                 "scene_change":  scene_ch,
+                "scenic_visual_score": _scenic_visual_score(small),
             })
             prev_sampled = small
             second += 1

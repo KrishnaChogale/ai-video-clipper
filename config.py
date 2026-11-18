@@ -62,10 +62,11 @@ CLIP_DEFAULT_COUNT = 5        # number of clips to generate
 CLIP_TOP_K_MAX = 20           # hard cap on clips per run
 
 # ─────────────────────────── DEAD AIR & JUMP-CUTS ───────────────────────────
-REMOVE_DEAD_AIR_DEFAULT = True
-DEAD_AIR_MIN_PAUSE_SEC = 0.45    # Pauses longer than this are trimmed (0.45s)
-DEAD_AIR_NOISE_THRESH_DB = -32.0 # Audio silence threshold in dB
-DEAD_AIR_PAD_SEC = 0.06          # Natural breath padding on speech cuts
+REMOVE_DEAD_AIR_DEFAULT = False  # Keep natural dialogue pauses unless the user opts in.
+DEAD_AIR_MIN_PAUSE_SEC = 0.90    # Ignore ordinary breaths and short conversational pauses.
+DEAD_AIR_NOISE_THRESH_DB = -38.0 # Be less sensitive to quiet ambience/gameplay audio.
+DEAD_AIR_PAD_SEC = 0.14          # Preserve more context around speech boundaries.
+DEAD_AIR_MIN_KEEP_BETWEEN_CUTS_SEC = 5.0
 
 # ─────────────────────────── HIGHLIGHT SCORING WEIGHTS ───────────────────────────
 # Must sum to 100
@@ -80,15 +81,16 @@ SCORE_WEIGHTS = {
 
 # Evidence factors are bounded independently so audio peaks cannot dominate.
 HIGHLIGHT_FACTOR_WEIGHTS = {
-    "event_significance": 22,
+    "event_significance": 20,
     "event_clarity": 16,
-    "visual_action": 16,
-    "audio_excitement": 10,
+    "visual_action": 14,
+    "audio_excitement": 9,
     "unexpectedness": 12,
     "build_up_payoff": 10,
-    "story_context": 5,
+    "story_context": 4,
     "replay_potential": 5,
-    "video_quality": 4,
+    "video_quality": 2,
+    "visual_beauty": 8,
 }
 
 # ─────────────────────────── EXPORT / FFMPEG ───────────────────────────

@@ -20,7 +20,10 @@ sys.path.insert(0, BASE_DIR)
 
 import config
 from modules.gpu_utils import get_device_info, release_gpu_memory
-from modules.video_ingestion import download_youtube_video, probe_video, accept_local_file
+from modules.video_ingestion import (
+    download_youtube_video, capture_live_stream_segment, identify_live_platform,
+    probe_video, accept_local_file,
+)
 from modules.audio_analysis import analyze_audio
 from modules.speech_recognition import transcribe_audio
 from modules.object_detection import analyze_visuals
@@ -29,6 +32,10 @@ from modules.highlight_scoring import compute_per_second_scores, select_highligh
 from modules.title_generator import generate_titles, generate_hooks
 from modules.description_generator import generate_descriptions, generate_hashtags
 from modules.subtitle_generator import generate_clip_ass, generate_clip_srt, censor_profanity
+from modules.caption_templates import (
+    CAPTION_TEMPLATES, get_caption_template, load_custom_templates,
+    save_custom_template, reset_custom_templates,
+)
 from modules.clip_editor import build_clip_package, zip_all_clips, FFMPEG_EXE, _use_nvenc
 from modules.thumbnail_generator import extract_thumbnail
 from modules.quality_control import evaluate_clip
@@ -100,9 +107,10 @@ with st.sidebar:
         clip_max_dur = min(180, clip_length + 5)
 
     remove_dead_air = st.checkbox(
-        "✂️ Remove Dead Air & Pauses (Jump-Cuts)",
+        "✂️ Remove Long Dead Air (limited jump-cuts)",
         value=config.REMOVE_DEAD_AIR_DEFAULT,
-        help="Cuts pauses and silent gaps >0.45s to maximize viewer retention on Shorts and Reels.",
+        key="remove_dead_air_enabled_v2",
+        help="Off by default to preserve natural dialogue. When enabled, only the longest pauses are removed, with a limit of about two cuts per 30 seconds.",
     )
 
     st.markdown("---")
@@ -112,12 +120,79 @@ with st.sidebar:
         ["9:16 Vertical (Full Screen)", "9:16 Blurred Background", "Original Aspect Ratio"],
         index=0,
     )
+    export_preset = st.selectbox(
+        "Export Preset",
+        ["YouTube Shorts (9:16)", "Instagram Reels (9:16)", "TikTok (9:16)", "YouTube Landscape (16:9)"],
+    )
+    export_codec = st.selectbox("Video codec", ["H.264", "H.265"], index=0,
+                                help="H.265 encoding is attempted only when FFmpeg supports it; hardware encoding is probed at runtime.")
+    export_fps = st.selectbox("Export FPS", [24, 30, 60], index=1)
+    export_quality = st.slider("Video quality (lower is higher quality)", 16, 28, config.EXPORT_CRF)
+    export_audio_bitrate = st.selectbox("Audio quality", ["128k", "192k", "256k", "320k"], index=1)
+    export_vertical = (export_preset != "YouTube Landscape (16:9)"
+                       and aspect_mode != "Original Aspect Ratio")
+    export_settings = {
+        "width": 1080 if export_vertical else 1920,
+        "height": 1920 if export_vertical else 1080,
+        "fps": export_fps,
+        "codec": "h265" if export_codec == "H.265" else "h264",
+        "quality": export_quality,
+        "audio_bitrate": export_audio_bitrate,
+        "preset": export_preset,
+    }
+    face_track_vertical = st.checkbox(
+        "Face-aware vertical framing for streamer reactions",
+        value=True,
+        help="Tracks the largest visible face while framing portrait clips. Turn off to keep the fixed center crop.",
+    )
     burn_captions = st.checkbox("Burn Captions (Viral Kinetic Subtitles)", value=True)
+    saved_caption_templates = load_custom_templates()
+    available_caption_templates = {**CAPTION_TEMPLATES, **saved_caption_templates}
+    caption_template_name = st.selectbox(
+        "Caption Template",
+        list(available_caption_templates),
+        index=list(available_caption_templates).index("Gaming Style"),
+        disabled=not burn_captions,
+        help="Switching templates updates this preview immediately and applies the style on export.",
+    )
+    selected_caption_template = available_caption_templates[caption_template_name]
+    caption_font_size = st.slider("Caption font size", 24, 110,
+                                  int(selected_caption_template["fontsize_vertical"]),
+                                  disabled=not burn_captions,
+                                  key=f"caption_size_{caption_template_name}")
+    caption_font_family = st.selectbox(
+        "Font family", ["Arial", "Arial Black", "Impact", "Verdana"],
+        index=["Arial", "Arial Black", "Impact", "Verdana"].index(selected_caption_template["fontname"])
+        if selected_caption_template["fontname"] in ["Arial", "Arial Black", "Impact", "Verdana"] else 0,
+        disabled=not burn_captions,
+        key=f"caption_font_{caption_template_name}",
+    )
+    caption_base_hex = st.color_picker(
+        "Caption text color", selected_caption_template["base_color"], disabled=not burn_captions,
+        key=f"caption_base_{caption_template_name}",
+    )
+    caption_highlight_hex = st.color_picker(
+        "Caption highlight color", selected_caption_template["highlight_color"], disabled=not burn_captions,
+        key=f"caption_highlight_{caption_template_name}",
+    )
+    caption_outline = st.slider("Text outline", 0.0, 8.0,
+                                float(selected_caption_template["outline"]), 0.5,
+                                disabled=not burn_captions,
+                                key=f"caption_outline_{caption_template_name}")
+    caption_shadow = st.slider("Text shadow", 0.0, 5.0,
+                               float(selected_caption_template["shadow"]), 0.5,
+                               disabled=not burn_captions,
+                               key=f"caption_shadow_{caption_template_name}")
+    caption_max_words = st.slider("Maximum words per caption line", 1, 10,
+                                  int(selected_caption_template["max_words_per_cue"]),
+                                  disabled=not burn_captions,
+                                  key=f"caption_words_{caption_template_name}")
     dynamic_highlight = st.checkbox(
         "✨ Dynamic Word Highlighting (Reels/Shorts Pop)",
-        value=config.CAPTION_DYNAMIC_HIGHLIGHT_DEFAULT,
+        value=selected_caption_template["dynamic_highlight"],
         disabled=not burn_captions,
         help="Highlights each spoken word in vibrant yellow/gold with white base text.",
+        key=f"caption_dynamic_{caption_template_name}",
     )
     caption_position = st.selectbox(
         "Caption Placement",
@@ -130,12 +205,53 @@ with st.sidebar:
         value=True,
         disabled=not burn_captions,
     )
+    caption_style_overrides = {
+        "fontsize_vertical": caption_font_size,
+        "fontsize_horizontal": max(18, round(caption_font_size * 0.7)),
+        "fontname": caption_font_family,
+        "base_color": caption_base_hex,
+        "highlight_color": caption_highlight_hex,
+        "outline_color": selected_caption_template.get("outline_color", "#111111"),
+        "outline": caption_outline,
+        "shadow": caption_shadow,
+        "max_words_per_cue": caption_max_words,
+        "dynamic_highlight": dynamic_highlight,
+    }
+    base_style_name = caption_template_name if caption_template_name in CAPTION_TEMPLATES else "Gaming Style"
+    caption_style = get_caption_template(
+        base_style_name,
+        {**saved_caption_templates.get(caption_template_name, {}), **caption_style_overrides},
+    )
+    preview_text = "That was an incredible <span style='color:{}'>clutch</span>!".format(caption_highlight_hex)
+    st.markdown(
+        f"<div style='background:#17191f;border-radius:10px;padding:18px;text-align:center;"
+        f"font-family:{caption_font_family};font-size:{min(32, caption_font_size//2)}px;"
+        f"font-weight:{'800' if selected_caption_template['bold'] else '400'};color:{caption_base_hex};"
+        f"-webkit-text-stroke:{caption_outline}px {selected_caption_template['outline_color']};"
+        f"text-shadow:0 2px {caption_shadow}px #000'>"
+        f"{preview_text}</div>",
+        unsafe_allow_html=True,
+    )
+    save_col, reset_col = st.columns(2)
+    with save_col:
+        custom_template_name = st.text_input("Save current style as", placeholder="My Caption Style")
+        if st.button("Save template", disabled=not custom_template_name.strip()):
+            save_custom_template(custom_template_name, {
+                **selected_caption_template,
+                **caption_style_overrides,
+            })
+            st.rerun()
+    with reset_col:
+        st.caption("Custom templates are saved locally on this machine.")
+        if st.button("Reset custom templates"):
+            reset_custom_templates()
+            st.rerun()
 
     st.markdown("---")
     st.subheader("🎯 Content Tuning")
     content_style = st.selectbox(
         "Target Gameplay Style",
-        ["Balanced", "Action", "Funny", "Cinematic", "Discovery"],
+        ["Balanced", "Action", "Funny", "Cinematic", "Discovery", "Scenic Showcase"],
         index=0,
     )
     whisper_model = st.selectbox(
@@ -194,6 +310,41 @@ with tab_main:
                 st.success(f"Using uploaded cookie file: `{uploaded_cookie_file}`")
             else:
                 st.info("No `cookies.txt` detected yet. Upload one or place it in the project root.")
+
+    with st.expander("🔴 Capture from an ongoing livestream", expanded=False):
+        live_platform = st.selectbox(
+            "Livestream platform", ["Twitch", "Kick", "YouTube Live"],
+            key="live_stream_platform",
+        )
+        live_url = st.text_input(
+            f"{live_platform} channel or livestream URL",
+            key="live_stream_url",
+            placeholder={"Twitch": "https://twitch.tv/channel", "Kick": "https://kick.com/channel",
+                         "YouTube Live": "https://youtube.com/@channel/live"}[live_platform],
+        )
+        live_minutes = st.slider("Capture duration (minutes)", 1, 30, 5, key="live_capture_minutes")
+        st.caption("Captures the next segment from a currently live channel, then sends it through the normal clipping pipeline. Scheduled streams and replays are not captured here.")
+        detected_platform = identify_live_platform(live_url) if live_url else None
+        if live_url and detected_platform is None:
+            st.warning("Enter a Twitch, Kick, or YouTube Live URL.")
+        elif live_url and detected_platform != live_platform:
+            st.warning(f"This URL looks like {detected_platform}. Select that platform above.")
+        if live_url and st.button("⏺️ Record live segment", key="capture_live_segment"):
+            capture_cookies = uploaded_cookie_file if has_uploaded_cookie else default_cookie_file
+            if cookie_mode == "Upload cookies.txt" and uploaded_cookie_obj is not None:
+                with open(uploaded_cookie_file, "wb") as cookie_out:
+                    cookie_out.write(uploaded_cookie_obj.getbuffer())
+                capture_cookies = uploaded_cookie_file
+            with st.spinner(f"Recording {live_minutes} minutes from the live stream…"):
+                live_path, live_error = capture_live_stream_segment(
+                    live_url, live_minutes * 60, cookies_path=capture_cookies,
+                    expected_platform=live_platform,
+                )
+            if live_error:
+                st.error(f"Live capture failed: {live_error}")
+            else:
+                st.session_state["video_path"] = live_path
+                st.success(f"Captured live segment: `{os.path.basename(live_path)}`. You can now run the clipper.")
 
     if youtube_url and st.button("⬇️ Download Video", key="btn_yt_dl"):
         cookie_target = None
@@ -385,7 +536,18 @@ with tab_main:
                 ).strip()
                 h["transcript_snippet"] = snippet
 
-                if h.get("category") == "unknown" and not snippet:
+                if h.get("category") == "scenic" and not snippet:
+                    h["alt_titles"] = ["Take In This GTA View", "A Quiet Look at GTA's World", "GTA's World in Its Best Light"]
+                    h["selected_title"] = h["alt_titles"][0]
+                    h["alt_hooks"] = ["Take a second to look at this view", "A calmer moment in the GTA world", "Here is a scenic moment from the game"]
+                    h["hook"] = h["alt_hooks"][0]
+                    h["hashtags"] = ["#GTA", "#GTAGameplay", "#GamingClips", "#GameWorld"]
+                    h.update({
+                        "yt_description": "A scenic showcase moment from GTA gameplay.\n\n#GTA #GTAGameplay #GamingClips",
+                        "ig_description": "A scenic moment from the GTA world 🎮\n\n#GTA #GTAGameplay #GamingClips",
+                        "tt_description": "A quiet look at the GTA game world 🎮\n#GTA #GTAGameplay #GamingClips",
+                    })
+                elif h.get("category") == "unknown" and not snippet:
                     # The current local models cannot describe silent visuals.
                     # Keep metadata factual instead of inventing a chase/crash.
                     h["alt_titles"] = ["A GTA Moment Worth Replaying",
@@ -427,8 +589,10 @@ with tab_main:
         src_w = v_probe.get("width", 0)
         src_h = v_probe.get("height", 0)
 
-        is_vertical = (aspect_mode != "Original Aspect Ratio")
-        crop_style_choice = "blur_bg" if "Blurred Background" in aspect_mode else "center"
+        is_vertical = export_vertical
+        crop_style_choice = "blur_bg" if "Blurred Background" in aspect_mode else (
+            "face" if is_vertical and face_track_vertical else "center"
+        )
 
         final_clips = []
         for i, h in enumerate(highlights):
@@ -453,6 +617,7 @@ with tab_main:
                     position=caption_position,
                     censor_swear_words=censor_swear,
                     dynamic_highlight=dynamic_highlight,
+                    caption_style=caption_style,
                 )
                 srt_content = generate_clip_srt(
                     transcript=transcript,
@@ -469,6 +634,8 @@ with tab_main:
                 "duration":         h["end"] - h["start"],
                 "category":         h.get("category", content_style.lower()),
                 "score":            h.get("score", 0.0),
+                "highlight_reason": h.get("reason", ""),
+                "score_factors":    h.get("score_factors", {}),
                 "peak_second":      h.get("peak_second"),
                 "hook_score":       h.get("hook_score", 0.0),
                 "hook_type":        h.get("hook_type", "action_onset"),
@@ -481,7 +648,13 @@ with tab_main:
                 "tt_description":   h.get("tt_description", ""),
                 "hashtags":         h.get("hashtags", []),
                 "words_list":       words_list or [],
+                "transcript":       transcript or [],
                 "caption_position": caption_position,
+                "caption_template": caption_template_name,
+                "caption_style": caption_style,
+                "export_settings": export_settings,
+                "crop_style": crop_style_choice,
+                "remove_dead_air": remove_dead_air,
             }
 
             pkg = build_clip_package(
@@ -497,6 +670,7 @@ with tab_main:
                 src_height=src_h,
                 metadata=metadata_dict,
                 remove_dead_air=remove_dead_air,
+                export_settings=export_settings,
             )
 
             if not pkg["success"]:
@@ -560,6 +734,90 @@ with tab_main:
                     m2.metric("3s Hook Strength", f"{meta.get('hook_score', 0):.0f}%")
                     silence_rem = meta.get("silence_removed_sec", 0.0)
                     m3.metric("Dead Air Cut", f"{silence_rem:.1f}s" if silence_rem > 0 else "Tight")
+                    if meta.get("highlight_reason"):
+                        st.caption(meta["highlight_reason"])
+                    if meta.get("score_factors"):
+                        with st.expander("Why this moment was selected"):
+                            st.json(meta["score_factors"])
+
+                    with st.expander("Transcript and clip trim"):
+                        duration_info = probe_video(meta.get("source_path", "")) if meta.get("source_path") else {}
+                        source_duration = max(float(duration_info.get("duration", meta.get("end_sec", 0))), 1.0)
+                        clip_start_edit = st.number_input(
+                            "Clip start (seconds)", min_value=0.0, max_value=source_duration,
+                            value=float(meta.get("start_sec", 0)), step=0.1, key=f"clip_start_{idx}",
+                        )
+                        clip_end_edit = st.number_input(
+                            "Clip end (seconds)", min_value=0.1, max_value=source_duration,
+                            value=float(meta.get("end_sec", 1)), step=0.1, key=f"clip_end_{idx}",
+                        )
+                        transcript_excerpt = [
+                            {"Start": round(float(seg.get("start", 0)), 2),
+                             "End": round(float(seg.get("end", 0)), 2),
+                             "Transcript": seg.get("text", "")}
+                            for seg in meta.get("transcript", [])
+                            if float(seg.get("end", 0)) > clip_start_edit
+                            and float(seg.get("start", 0)) < clip_end_edit
+                        ]
+                        if transcript_excerpt:
+                            st.dataframe(transcript_excerpt, hide_index=True, use_container_width=True)
+                        else:
+                            st.caption("No recognized speech falls inside this time range.")
+                        if st.button("Apply trim and re-render", key=f"apply_trim_{idx}"):
+                            if clip_end_edit <= clip_start_edit:
+                                st.error("Clip end must be later than clip start.")
+                            else:
+                                edited_meta = dict(meta)
+                                edited_meta.update({
+                                    "start_sec": float(clip_start_edit),
+                                    "end_sec": float(clip_end_edit),
+                                    "duration": float(clip_end_edit - clip_start_edit),
+                                    "clip_id": f"{meta.get('clip_id', f'clip_{idx+1:02d}')}_edit",
+                                })
+                                edited_ass = generate_clip_ass(
+                                    words_list=edited_meta.get("words_list", []),
+                                    transcript=edited_meta.get("transcript", []),
+                                    clip_start=clip_start_edit, clip_end=clip_end_edit,
+                                    crop_vertical=bool((edited_meta.get("export_settings") or {}).get("height", 1920)
+                                                       > (edited_meta.get("export_settings") or {}).get("width", 1080)),
+                                    position=edited_meta.get("caption_position", "Bottom (Shorts/TikTok)"),
+                                    caption_style=edited_meta.get("caption_style"),
+                                ) if edited_meta.get("words_list") or edited_meta.get("transcript") else None
+                                edited_srt = generate_clip_srt(
+                                    edited_meta.get("transcript", []), clip_start_edit, clip_end_edit
+                                ) if edited_meta.get("transcript") else None
+                                export_opts = edited_meta.get("export_settings") or {}
+                                edited_pkg = build_clip_package(
+                                    clip_id=edited_meta["clip_id"],
+                                    source_path=edited_meta["source_path"],
+                                    start_sec=clip_start_edit, end_sec=clip_end_edit,
+                                    ass_content=edited_ass, srt_content=edited_srt,
+                                    vertical=bool(export_opts.get("height", 1920) > export_opts.get("width", 1080)),
+                                    crop_style=edited_meta.get("crop_style", "center"),
+                                    src_width=int(duration_info.get("width", 0)),
+                                    src_height=int(duration_info.get("height", 0)),
+                                    metadata=edited_meta,
+                                    remove_dead_air=bool(edited_meta.get("remove_dead_air", False)),
+                                    export_settings=export_opts,
+                                )
+                                if edited_pkg.get("success"):
+                                    edited_qc = evaluate_clip(
+                                        edited_pkg["clip_path"], clip_start_edit, clip_end_edit,
+                                        edited_meta.get("score", 0), min_score=5.0,
+                                    )
+                                    edited_meta.update({"clip_path": edited_pkg["clip_path"],
+                                                        "thumbnail_path": edited_pkg.get("thumbnail_path", ""),
+                                                        "qc_passed": edited_qc["passed"], "qc_issues": edited_qc["issues"]})
+                                    save_clip_metadata(edited_meta)
+                                    updated_clip = {**clip, **edited_pkg, "metadata": edited_meta, "qc": edited_qc}
+                                    current_clips = list(st.session_state.get("final_clips", []))
+                                    if idx < len(current_clips):
+                                        current_clips[idx] = updated_clip
+                                        st.session_state["final_clips"] = current_clips
+                                    st.success("Updated trim rendered and checked.")
+                                    st.rerun()
+                                else:
+                                    st.error(f"Could not re-render trim: {edited_pkg.get('error')}")
 
                     if passed:
                         st.success("✅ Quality Check: Passed all retention & technical checks")

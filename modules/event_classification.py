@@ -39,9 +39,13 @@ def classify_events(energy_buckets, visual_scores, transcript):
             events.append("speech")
         if v.get("scene_change"):
             events.append("scene_change")
+        scenic_score = float(v.get("scenic_visual_score", 0))
+        if scenic_score >= 68:
+            events.append("scenic_showcase")
+            confidence = max(confidence, min(0.75, scenic_score / 140.0))
         # No present model distinguishes collisions, pursuits, stunts, NPC comedy,
         # thefts, or cinematic intent. Do not claim those categories from proxies.
-        category = "unknown"
+        category = "scenic" if "scenic_showcase" in events else "unknown"
         result.append({"second": sec, "category": category, "events": events,
                        "confidence": round(confidence, 2),
                        "temporal_strength": round(temporal, 2),
