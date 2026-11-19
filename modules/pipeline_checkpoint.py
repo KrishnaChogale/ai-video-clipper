@@ -37,6 +37,12 @@ STANDARD_STAGES = [
     "clip_export",
 ]
 
+STAGE_ALIASES = {
+    "speech_recognition": "transcription",
+    "audio": "audio_analysis",
+    "visuals": "visual_analysis",
+}
+
 
 class PipelineCheckpoint:
     """Manages persistent disk checkpoints for AI video clipper jobs."""
@@ -79,7 +85,8 @@ class PipelineCheckpoint:
         return os.path.join(self.get_job_dir(job_id), "manifest.json")
 
     def _stage_path(self, job_id: str, stage_name: str) -> str:
-        return os.path.join(self.get_job_dir(job_id), f"{stage_name}.json")
+        canonical_stage = STAGE_ALIASES.get(stage_name, stage_name)
+        return os.path.join(self.get_job_dir(job_id), f"{canonical_stage}.json")
 
     def _atomic_write_json(self, target_path: str, data: Any) -> None:
         """Write JSON data atomically to prevent corrupt files on sudden crash."""
@@ -151,6 +158,7 @@ class PipelineCheckpoint:
 
     def is_stage_completed(self, job_id_or_path: str, stage_name: str) -> bool:
         """Check if a specific pipeline stage has completed and its checkpoint exists."""
+        stage_name = STAGE_ALIASES.get(stage_name, stage_name)
         if job_id_or_path.startswith("job_"):
             job_id = job_id_or_path
         else:
@@ -178,6 +186,7 @@ class PipelineCheckpoint:
         stage_metadata: Optional[dict] = None,
     ) -> bool:
         """Atomically persist a stage's results to disk and update manifest."""
+        stage_name = STAGE_ALIASES.get(stage_name, stage_name)
         if job_id_or_path.startswith("job_"):
             job_id = job_id_or_path
         else:
@@ -231,6 +240,7 @@ class PipelineCheckpoint:
         
         Returns None if stage is incomplete or corrupted.
         """
+        stage_name = STAGE_ALIASES.get(stage_name, stage_name)
         if not self.is_stage_completed(job_id_or_path, stage_name):
             return None
 
