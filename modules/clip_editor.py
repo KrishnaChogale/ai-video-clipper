@@ -199,6 +199,7 @@ def cut_clip(
     src_height: int = 0,
     keep_intervals: list[tuple[float, float]] | None = None,
     export_settings: dict | None = None,
+    facecam_layout: dict | None = None,
 ) -> tuple[bool, str]:
     """
     Cut a clip from source_path using FFmpeg.
@@ -210,6 +211,12 @@ def cut_clip(
     export_settings = export_settings or {}
     out_w = int(export_settings.get("width", config.EXPORT_WIDTH))
     out_h = int(export_settings.get("height", config.EXPORT_HEIGHT))
+
+    if facecam_layout:
+        return _cut_facecam_split(
+            source_path, start_sec, end_sec, output_path, ass_path,
+            out_w, out_h, src_width, src_height, facecam_layout, export_settings,
+        )
 
     # Case A: Jump-cuts (Multiple keep intervals after dead-air removal)
     if keep_intervals and len(keep_intervals) > 1:
@@ -321,7 +328,7 @@ def cut_clip(
     return _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path, vertical, crop_style, src_width, src_height, export_settings=export_settings)
 
 
-def _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path, vertical, crop_style, src_width, src_height, keep_intervals=None, export_settings=None):
+def _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path, vertical, crop_style, src_width, src_height, keep_intervals=None, export_settings=None, facecam_layout=None):
     export_settings = export_settings or {}
     use_hw = _use_nvenc()
     codec = str(export_settings.get("codec", "h264")).lower()
@@ -355,13 +362,168 @@ def _execute_ffmpeg(cmd, output_path, source_path, start_sec, end_sec, ass_path,
                 logger.warning("NVENC failed, retrying on libx264: %s", res.stderr[-500:])
                 global _NVENC_AVAILABLE
                 _NVENC_AVAILABLE = False
-                return cut_clip(source_path, start_sec, end_sec, output_path, ass_path, vertical, crop_style, src_width, src_height, keep_intervals=keep_intervals, export_settings=export_settings)
+                return cut_clip(source_path, start_sec, end_sec, output_path, ass_path, vertical, crop_style, src_width, src_height, keep_intervals=keep_intervals, export_settings=export_settings, facecam_layout=facecam_layout)
             return False, f"FFmpeg error:\n{res.stderr[-2000:]}"
         return True, output_path
     except subprocess.TimeoutExpired:
         return False, "FFmpeg timed out (>600s)"
     except Exception as e:
         return False, str(e)
+
+
+def _ffmpeg_filter_path(path: str) -> str:
+    return os.path.abspath(path).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+
+
+def _tracked_crop_expression(points: list[dict], key: str, fallback: float) -> str:
+    """Create a bounded, piecewise-linear FFmpeg expression from tracked points."""
+    if not points:
+        return str(int(fallback))
+    ordered = sorted(points, key=lambda p: float(p.get("t", 0)))
+    expr = str(int(float(ordered[-1].get(key, fallback))))
+    for idx in range(len(ordered) - 2, -1, -1):
+        p0, p1 = ordered[idx], ordered[idx + 1]
+        t0, t1 = float(p0.get("t", 0)), float(p1.get("t", 0))
+        v0, v1 = float(p0.get(key, fallback)), float(p1.get(key, fallback))
+        if t1 <= t0:
+            continue
+        linear = f"{v0:.2f}+({v1-v0:.2f})*(t-{t0:.3f})/{t1-t0:.3f}"
+        expr = f"if(lt(t\\,{t1:.3f})\\,{linear}\\,{expr})"
+    return expr
+
+
+def _cut_facecam_split(source_path, start_sec, end_sec, output_path, ass_path,
+                       out_w, out_h, src_width, src_height, layout, export_settings):
+    """Render a tracked facecam top panel, cleaned gameplay panel, and optional banner."""
+    region = layout.get("region") or {}
+    overlay = layout.get("overlay") or {}
+    raw_crop_w = int(region.get("width", 0))
+    raw_crop_h = int(region.get("height", 0))
+    if raw_crop_w < 2 or raw_crop_h < 2:
+        return False, "Facecam crop region is missing. Re-run analysis with facecam detection enabled."
+    crop_w = max(2, min(out_w * 2, raw_crop_w))
+    crop_h = max(2, min(out_h * 2, raw_crop_h))
+    percent = max(35, min(65, int(layout.get("facecam_percent", 45))))
+    banner_text = str(layout.get("headline_text") or "").strip()
+    branding = str(layout.get("branding_text") or "").strip()
+    banner_h = int(out_h * 0.075) if banner_text else 0
+    banner_h = banner_h - (banner_h % 2)  # Must be even for YUV420p
+    top_h = int((out_h - banner_h) * percent / 100)
+    top_h = max(2, top_h - (top_h % 2))   # Must be even
+    bottom_h = out_h - banner_h - top_h   # Exactly fills remaining height; even - even - even is even
+    duration = max(1.0, float(end_sec - start_sec))
+
+    tracks = layout.get("tracks") or []
+    fallback_x = max(0, int(region.get("x", 0)))
+    fallback_y = max(0, int(region.get("y", 0)))
+    x_expr = _tracked_crop_expression(tracks, "x", fallback_x)
+    y_expr = _tracked_crop_expression(tracks, "y", fallback_y)
+    # Delogo bounds: ensure strictly inside frame boundaries with band margin
+    margin = 4
+    overlay_x = max(margin, min(max(margin, src_width - margin - 4), int(overlay.get("x", 0))))
+    overlay_y = max(margin, min(max(margin, src_height - margin - 4), int(overlay.get("y", 0))))
+    overlay_w = max(2, min(max(2, src_width - overlay_x - margin), int(overlay.get("width", 2))))
+    overlay_h = max(2, min(max(2, src_height - overlay_y - margin), int(overlay.get("height", 2))))
+
+    # Smooth reaction zoom and gameplay climax expressions
+    face_zoom_expr = layout.get("face_zoom_expr")
+    game_zoom_expr = layout.get("game_zoom_expr")
+
+    if face_zoom_expr:
+        face_branch = (
+            f"[face_src]crop={crop_w}:{crop_h}:{x_expr}:{y_expr},"
+            f"scale={out_w}:{top_h}:force_original_aspect_ratio=increase,crop={out_w}:{top_h},"
+            f"scale=w='{out_w}*({face_zoom_expr})':h='{top_h}*({face_zoom_expr})':eval=frame,"
+            f"crop={out_w}:{top_h}:(in_w-out_w)/2:(in_h-out_h)/2[face]"
+        )
+    else:
+        face_branch = (
+            f"[face_src]crop={crop_w}:{crop_h}:{x_expr}:{y_expr},"
+            f"scale={out_w}:{top_h}:force_original_aspect_ratio=increase,crop={out_w}:{top_h}[face]"
+        )
+
+    if game_zoom_expr:
+        game_branch = (
+            f"[game_bg][game_fg]overlay=(W-w)/2:(H-h)/2,"
+            f"scale=w='{out_w}*({game_zoom_expr})':h='{bottom_h}*({game_zoom_expr})':eval=frame,"
+            f"crop={out_w}:{bottom_h}:(in_w-out_w)/2:(in_h-out_h)/2[game]"
+        )
+    else:
+        game_branch = "[game_bg][game_fg]overlay=(W-w)/2:(H-h)/2[game]"
+
+    filter_parts = [
+        f"[0:v]setpts=PTS-STARTPTS,split=2[face_src][game_src]",
+        face_branch,
+        f"[game_src]delogo=x={overlay_x}:y={overlay_y}:w={overlay_w}:h={overlay_h}:show=0,"
+        f"split=2[game_bg_in][game_fg_in]",
+        f"[game_bg_in]scale={out_w}:{bottom_h}:force_original_aspect_ratio=increase,"
+        f"crop={out_w}:{bottom_h},boxblur=20:5[game_bg]",
+        f"[game_fg_in]scale={out_w}:{bottom_h}:force_original_aspect_ratio=decrease[game_fg]",
+        game_branch,
+    ]
+
+    banner_bg = layout.get("banner_bg", "0x16181C")
+    accent_color = layout.get("accent_color", "0x00F0FF")
+    classic_banner = layout.get("classic_white_banner", False)
+
+    if banner_h:
+        bg_col = "white" if classic_banner else banner_bg
+        filter_parts.append(f"color=c={bg_col}:s={out_w}x{banner_h}:d={duration}[banner]")
+        filter_parts.append("[face][banner][game]vstack=inputs=3[stack0]")
+    else:
+        filter_parts.append("[face][game]vstack=inputs=2[stack0]")
+
+    current = "stack0"
+    if banner_h and not classic_banner:
+        # Add sleek colored accent divider strip under banner
+        next_tag = "stack_accent"
+        filter_parts.append(
+            f"[{current}]drawbox=x=0:y={top_h+banner_h-4}:w={out_w}:h=4:color={accent_color}@1.0:t=fill[{next_tag}]"
+        )
+        current = next_tag
+
+    text_files = []
+    fontfile = r"C\:/Windows/Fonts/arialbd.ttf"
+    if banner_text:
+        text_path = os.path.splitext(output_path)[0] + "_headline.txt"
+        with open(text_path, "w", encoding="utf-8") as handle:
+            handle.write(banner_text.replace("\n", " "))
+        text_files.append(text_path)
+        next_tag = "stack1"
+        font_col = "black" if classic_banner else "white"
+        filter_parts.append(
+            f"[{current}]drawtext=fontfile='{fontfile}':textfile='{_ffmpeg_filter_path(text_path)}':"
+            f"expansion=none:fontcolor={font_col}:fontsize={max(28, int(out_w*0.044))}:"
+            f"shadowcolor=black@0.6:shadowx=2:shadowy=2:"
+            f"x=(w-text_w)/2:y={top_h}+({banner_h}-text_h)/2[{next_tag}]"
+        )
+        current = next_tag
+    if branding:
+        brand_path = os.path.splitext(output_path)[0] + "_branding.txt"
+        with open(brand_path, "w", encoding="utf-8") as handle:
+            handle.write(branding.replace("\n", " "))
+        text_files.append(brand_path)
+        next_tag = "stack_brand"
+        filter_parts.append(
+            f"[{current}]drawtext=fontfile='{fontfile}':textfile='{_ffmpeg_filter_path(brand_path)}':"
+            f"expansion=none:fontcolor=white:fontsize={max(18, int(out_w*0.023))}:"
+            f"box=1:boxcolor=black@0.55:boxborderw=12:x=w-text_w-24:y=h-text_h-24[{next_tag}]"
+        )
+        current = next_tag
+    if ass_path and os.path.isfile(ass_path):
+        ass_escaped = _ffmpeg_filter_path(ass_path)
+        filter_parts.append(f"[{current}]ass='{ass_escaped}'[vfinal]")
+        video_map = "[vfinal]"
+    else:
+        video_map = f"[{current}]"
+
+    cmd = [FFMPEG_EXE, "-y", "-ss", str(start_sec), "-i", source_path, "-t", str(duration),
+           "-filter_complex", ";".join(filter_parts), "-map", video_map, "-map", "0:a:0?"]
+    return _execute_ffmpeg(
+        cmd, output_path, source_path, start_sec, end_sec, ass_path, True,
+        "facecam_split", out_w, out_h, export_settings=export_settings,
+        facecam_layout=layout,
+    )
 
 
 def build_clip_package(
@@ -379,6 +541,7 @@ def build_clip_package(
     output_root: str | None = None,
     remove_dead_air: bool = True,
     export_settings: dict | None = None,
+    facecam_layout: dict | None = None,
 ) -> dict:
     """
     Build complete export package for a single clip:
@@ -414,7 +577,7 @@ def build_clip_package(
     total_removed = 0.0
     words_list = metadata.get("words_list") if metadata else None
 
-    if remove_dead_air:
+    if remove_dead_air and not facecam_layout:
         cut_intervals, keep_intervals, total_removed = detect_dead_air(
             source_path, start_sec, end_sec, words_list=words_list
         )
@@ -442,8 +605,9 @@ def build_clip_package(
                 dynamic_highlight=bool((style or {}).get("dynamic_highlight", True)),
                 caption_style=style,
                 hook_text=hook_text,
-                burn_hook=burn_hook,
+                burn_hook=burn_hook and not bool(facecam_layout),
                 add_emojis=add_emojis,
+                facecam_split=bool(facecam_layout),
             )
 
     # 2. Write ASS & SRT files
@@ -468,6 +632,7 @@ def build_clip_package(
         src_width=src_width, src_height=src_height,
         keep_intervals=keep_intervals,
         export_settings=export_settings,
+        facecam_layout=facecam_layout,
     )
 
     if not success:

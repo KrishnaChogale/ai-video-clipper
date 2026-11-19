@@ -81,19 +81,30 @@ def _scenic_visual_score(frame) -> float:
     return round(0.55 * color_score + 0.45 * exposure_score, 2)
 
 
-def _extract_frames_ffmpeg(video_path: str, fps: int = 1, width: int = 640, height: int = 360):
-    """Fast frame extraction using FFmpeg pipe scaled directly in C."""
-    cmd = [
-        FFMPEG_EXE, "-v", "error",
-        "-i", video_path,
+def _extract_frames_ffmpeg(
+    video_path: str,
+    fps: int = 1,
+    width: int = 640,
+    height: int = 360,
+    start_sec: float = 0.0,
+    duration_sec: float = 0.0,
+):
+    """Fast frame extraction using FFmpeg pipe scaled directly in C, with optional time range."""
+    cmd = [FFMPEG_EXE, "-v", "error"]
+    if start_sec > 0:
+        cmd.extend(["-ss", str(start_sec)])
+    cmd.extend(["-i", video_path])
+    if duration_sec > 0:
+        cmd.extend(["-t", str(duration_sec)])
+    cmd.extend([
         "-vf", f"fps={fps},scale={width}:{height}",
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
         "pipe:1"
-    ]
+    ])
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
     frame_size = width * height * 3
-    second = 0
+    second = int(start_sec)
     while True:
         buf = proc.stdout.read(frame_size)
         if len(buf) < frame_size:
@@ -108,14 +119,22 @@ def _extract_frames_ffmpeg(video_path: str, fps: int = 1, width: int = 640, heig
 def analyze_visuals(
     video_path: str,
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    detect_facecam: bool = False,
+    start_sec: float = 0.0,
+    duration_sec: float = 0.0,
 ) -> list[dict]:
     """
     Sample 1 frame per second using hardware/FFmpeg optimized pipeline.
     Returns list of per-second dicts with visual_score, motion, scene_change.
+    Supports start_sec and duration_sec for segmented stream processing.
     """
     model = _get_yolo()
     import torch
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    facecam_analyzer = None
+    if detect_facecam:
+        from modules.facecam import FacecamAnalyzer
+        facecam_analyzer = FacecamAnalyzer()
 
     scores = []
     prev_sampled = None
@@ -123,11 +142,13 @@ def analyze_visuals(
     # Get duration for progress estimation
     from modules.video_ingestion import probe_video
     vinfo = probe_video(video_path)
-    total_sec = max(1.0, float(vinfo.get("duration", 60.0)))
+    total_sec = float(duration_sec) if duration_sec > 0 else max(1.0, float(vinfo.get("duration", 60.0)))
 
     # 1. Attempt ultra-fast FFmpeg frame pipe
     try:
-        for second, small in _extract_frames_ffmpeg(video_path, fps=config.YOLO_SAMPLE_FPS):
+        for second, small in _extract_frames_ffmpeg(
+            video_path, fps=config.YOLO_SAMPLE_FPS, start_sec=start_sec, duration_sec=duration_sec
+        ):
             results = model(small, device=device, verbose=False)[0]
             det_score = 0.0
             for box in results.boxes:
@@ -138,6 +159,7 @@ def analyze_visuals(
 
             motion   = _motion_score(prev_sampled, small)
             scene_ch = _is_scene_change(prev_sampled, small)
+            face = facecam_analyzer.analyze(small) if facecam_analyzer else {}
 
             scores.append({
                 "second":        second,
@@ -145,6 +167,10 @@ def analyze_visuals(
                 "motion":        round(motion, 2),
                 "scene_change":  scene_ch,
                 "scenic_visual_score": _scenic_visual_score(small),
+                "facecam_box": face.get("box"),
+                "facecam_motion": face.get("motion", 0.0),
+                "facecam_smile": face.get("smile", 0.0),
+                "blendshapes": face.get("blendshapes", {}),
             })
 
             prev_sampled = small
@@ -165,12 +191,17 @@ def analyze_visuals(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_interval = max(1, int(round(fps / config.YOLO_SAMPLE_FPS)))
     frame_idx = 0
-    second = 0
+    second = int(start_sec)
+    if start_sec > 0:
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_sec * 1000.0)
     scores = []
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
+            break
+
+        if duration_sec > 0 and (second - int(start_sec)) >= duration_sec:
             break
 
         if frame_idx % frame_interval == 0:
@@ -185,6 +216,7 @@ def analyze_visuals(
 
             motion   = _motion_score(prev_sampled, small)
             scene_ch = _is_scene_change(prev_sampled, small)
+            face = facecam_analyzer.analyze(small) if facecam_analyzer else {}
 
             scores.append({
                 "second":        second,
@@ -192,6 +224,10 @@ def analyze_visuals(
                 "motion":        round(motion, 2),
                 "scene_change":  scene_ch,
                 "scenic_visual_score": _scenic_visual_score(small),
+                "facecam_box": face.get("box"),
+                "facecam_motion": face.get("motion", 0.0),
+                "facecam_smile": face.get("smile", 0.0),
+                "blendshapes": face.get("blendshapes", {}),
             })
             prev_sampled = small
             second += 1

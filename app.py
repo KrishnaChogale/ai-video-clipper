@@ -21,23 +21,37 @@ import sqlite3
 import shutil
 import io
 import subprocess
+import math
+import logging
 import streamlit as st
+
+logger = logging.getLogger(__name__)
 
 # ─────────────────────── PATH SETUP ───────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 import config
+import psutil
 from modules.gpu_utils import get_device_info, release_gpu_memory
+from modules.pipeline_checkpoint import PipelineCheckpoint
+from modules.long_stream_manager import (
+    plan_video_segments,
+    deduplicate_cross_segment_candidates,
+    generate_empty_output_diagnostic,
+)
 from modules.video_ingestion import (
     download_youtube_video, capture_live_stream_segment, identify_live_platform,
     probe_video, accept_local_file,
 )
-from modules.audio_analysis import analyze_audio
+from modules.audio_analysis import analyze_audio, clear_audio_cache
 from modules.speech_recognition import transcribe_audio
 from modules.object_detection import analyze_visuals
+from modules.facecam import summarize_facecam, build_facecam_layout
 from modules.event_classification import classify_events
 from modules.highlight_scoring import compute_per_second_scores, select_highlights
+from modules.clip_ranker import ClipRanker
+from modules.unified_quality_scorer import UnifiedQualityScorer
 from modules.title_generator import generate_titles, generate_hooks
 from modules.description_generator import generate_descriptions, generate_hashtags
 from modules.subtitle_generator import generate_clip_ass, generate_clip_srt, censor_profanity
@@ -66,6 +80,7 @@ _DEFAULTS = {
     "energy_scores": None,
     "visual_scores": None,
     "highlights":    None,
+    "facecam_summary": None,
     "final_clips":   [],
     "step_done":     0,
 }
@@ -81,6 +96,9 @@ with st.sidebar:
     with st.expander("🖥️ GPU & Hardware Status", expanded=True):
         try:
             dev_info = get_device_info()
+            vm = psutil.virtual_memory()
+            st.markdown(f"**CPU:** 13th Gen Intel i5-13450HX (16 threads)")
+            st.markdown(f"**RAM:** {vm.used / (1024**3):.1f} GB / {vm.total / (1024**3):.1f} GB ({vm.percent}%) | **{vm.available / (1024**3):.1f} GB free**")
             st.markdown(f"**GPU:** {dev_info.get('gpu_name', 'N/A')}")
             st.markdown(f"**VRAM:** {dev_info.get('vram_total_gb', 0):.1f} GB total / **{dev_info.get('vram_free_gb', 0):.1f} GB free**")
             st.markdown(f"**PyTorch CUDA:** {'✅ Active (v' + str(dev_info.get('torch_cuda_version')) + ')' if dev_info.get('cuda_available') else '❌ CPU Fallback'}")
@@ -91,7 +109,10 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("🎬 Highlight Generation")
-    clip_count = st.slider("Clips to generate", 1, 20, config.CLIP_DEFAULT_COUNT)
+    clips_per_hour = st.slider(
+        "Target clips per video hour", 1, 10, config.CLIP_DEFAULT_COUNT_PER_HOUR,
+        help="The app scales this target by the source duration. A 3-hour video targets 30 clips; a 4-hour video targets 40.",
+    )
 
     duration_preset = st.radio(
         "Duration Mode",
@@ -153,6 +174,35 @@ with st.sidebar:
         "Face-aware vertical framing for streamer reactions",
         value=True,
         help="Tracks the largest visible face while framing portrait clips. Turn off to keep the fixed center crop.",
+    )
+    video_has_facecam = st.checkbox(
+        "📹 Video contains streamer facecam",
+        value=True,
+        help="Check this if the stream contains an inset streamer camera overlay. Uncheck if this video is pure gameplay, a walkthrough, a VTuber without camera, or has no camera overlay.",
+    )
+    enable_facecam_split = st.checkbox(
+        "Automatic streamer facecam split-screen",
+        value=True,
+        disabled=not (export_vertical and video_has_facecam),
+        help="Detect stable inset facecams, rank reaction moments, and reserve the selected quota for split-screen exports.",
+    )
+    enable_facecam_split = bool(export_vertical and video_has_facecam and enable_facecam_split)
+    facecam_quota_percent = st.slider(
+        "Minimum facecam clip share (%)", 50, 90, 50, 5,
+        disabled=not enable_facecam_split,
+        help="The selector attempts at least this share. If the source has too few suitable facecam moments, it reports the shortfall.",
+    )
+    facecam_panel_percent = st.slider(
+        "Facecam panel height (%)", 35, 55, 45, 1,
+        disabled=not enable_facecam_split,
+    )
+    facecam_headline_enabled = st.checkbox(
+        "Headline band between split-screen panels", True,
+        disabled=not enable_facecam_split,
+    )
+    facecam_branding = st.text_input(
+        "Optional channel branding", "", max_chars=40,
+        disabled=not enable_facecam_split,
     )
     burn_captions = st.checkbox("Burn Captions (Viral Kinetic Subtitles)", value=True)
     saved_caption_templates = load_custom_templates()
@@ -472,10 +522,12 @@ with tab_main:
     video_path = st.session_state.get("video_path")
 
     # Video preview & probe info
+    video_duration_seconds = 0.0
     if video_path and os.path.isfile(video_path):
         v_meta = {}
         try:
             v_meta = probe_video(video_path)
+            video_duration_seconds = float(v_meta.get("duration", 0.0) or 0.0)
             c1, c2, c3, c4 = st.columns(4)
             dur = v_meta.get("duration", 0)
             c1.metric("Duration", f"{dur:.0f}s ({dur/60:.1f}m)" if dur < 3600 else f"{dur/3600:.1f}h ({dur/60:.0f}m)")
@@ -545,9 +597,38 @@ with tab_main:
                     if st.checkbox("Force full video player (may take time to buffer)", key=f"force_full_{sample_key}"):
                         st.video(video_path)
 
+    # Compute the total target from the selected per-hour rate. Floor partial
+    # hours to avoid exceeding the user's requested clips/hour ceiling.
+    clip_count = max(1, min(
+        int(video_duration_seconds / 3600.0 * clips_per_hour) if video_duration_seconds else clips_per_hour,
+        config.CLIP_TOP_K_MAX,
+    ))
+    if video_duration_seconds:
+        st.caption(
+            f"Target: up to {clip_count} clips for this {video_duration_seconds / 3600.0:.1f}-hour video "
+            f"({clips_per_hour} per hour). Lower counts may result when moments overlap or do not meet the quality threshold."
+        )
+
     # ── PIPELINE TRIGGER ─────────────────────────────────────────
     st.markdown("---")
     st.header("▶️ Run AI Pipeline")
+
+    pipeline_ckpt = PipelineCheckpoint()
+    current_job_id = pipeline_ckpt.compute_job_id(video_path) if (video_path and os.path.isfile(video_path)) else None
+    current_job_summary = pipeline_ckpt.get_job_summary(current_job_id) if current_job_id else None
+
+    force_restart_pipeline = False
+    if current_job_summary and current_job_summary.get("exists") and current_job_summary.get("completed_stages"):
+        st.markdown(
+            f"💾 **Resumable Checkpoint Found:** `{current_job_id}` &nbsp;·&nbsp; "
+            f"**{current_job_summary['completion_percent']}% completed**"
+        )
+        c_badges = " ".join([f"`{s}`" for s in current_job_summary["completed_stages"]])
+        st.caption(f"Completed stages on disk: {c_badges}")
+        ckpt_col1, ckpt_col2 = st.columns([1, 1])
+        with ckpt_col1:
+            resume_mode = st.radio("Checkpoint Action:", ["Resume from saved stages", "Recompute all stages from scratch"], index=0, horizontal=True)
+            force_restart_pipeline = (resume_mode == "Recompute all stages from scratch")
 
     btn_col1, btn_col2 = st.columns([2, 1])
     with btn_col1:
@@ -555,8 +636,9 @@ with tab_main:
             st.info("⬆️ Select or upload a video above to begin.")
             run_btn = False
         else:
+            action_label = "Resume AI Pipeline" if (current_job_summary and current_job_summary.get("exists") and not force_restart_pipeline) else "Find, Cut & Caption"
             run_btn = st.button(
-                f"✂️ Find, Cut & Caption {clip_count} Clips ({clip_length}s each)",
+                f"✂️ {action_label} up to {clip_count} Clips ({clip_length}s each)",
                 type="primary",
                 use_container_width=True,
             )
@@ -567,20 +649,45 @@ with tab_main:
             st.rerun()
 
     if video_path and os.path.isfile(video_path) and run_btn:
+        pipeline_ckpt.init_job(video_path, extra_metadata={"clip_count_target": clip_count, "clip_length": clip_length})
+
         # STEP 2: Audio & Speech Analysis
         st.markdown("---")
         st.subheader("Step 2/5 · Audio & Speech Analysis")
-        p2 = st.progress(0, "Loading audio...")
+        p2 = st.progress(0, "Checking audio & speech checkpoints...")
 
         try:
-            p2.progress(15, "Analyzing audio energy, onset spikes, and transients...")
-            energy_scores, audio_data, sr = analyze_audio(video_path)
-            st.session_state["energy_scores"] = energy_scores
+            # 2A. Audio Energy
+            if not force_restart_pipeline and pipeline_ckpt.is_stage_completed(current_job_id, "audio_analysis"):
+                p2.progress(25, "Restoring audio energy analysis from disk checkpoint...")
+                energy_scores = pipeline_ckpt.load_stage(current_job_id, "audio_analysis")
+                st.session_state["energy_scores"] = energy_scores
+                st.caption(f"⚡ Loaded {len(energy_scores)}s of audio analysis from checkpoint.")
+            else:
+                p2.progress(15, "Analyzing audio energy, onset spikes, and transients...")
+                energy_scores, audio_data, sr = analyze_audio(video_path, chunk_if_long=True)
+                pipeline_ckpt.save_stage(current_job_id, "audio_analysis", energy_scores)
+                st.session_state["energy_scores"] = energy_scores
+                clear_audio_cache()
 
-            p2.progress(45, f"Transcribing dialogue with Faster-Whisper ({whisper_model})...")
-            transcript, words_list = transcribe_audio(audio_data, model_size=whisper_model)
-            st.session_state["transcript"] = transcript
-            st.session_state["words_list"] = words_list
+            # 2B. Transcription
+            if not force_restart_pipeline and pipeline_ckpt.is_stage_completed(current_job_id, "transcription"):
+                p2.progress(50, "Restoring dialogue transcription from disk checkpoint...")
+                t_data = pipeline_ckpt.load_stage(current_job_id, "transcription") or {}
+                transcript = t_data.get("transcript", [])
+                words_list = t_data.get("words_list", [])
+                st.session_state["transcript"] = transcript
+                st.session_state["words_list"] = words_list
+                st.caption(f"⚡ Loaded {len(transcript)} dialogue segments from checkpoint.")
+            else:
+                p2.progress(45, f"Transcribing dialogue with Faster-Whisper ({whisper_model})...")
+                def _trans_cb(cur, tot, msg):
+                    pct = int(45 + (cur / max(1, tot)) * 50)
+                    p2.progress(pct, msg)
+                transcript, words_list = transcribe_audio(video_path, model_size=whisper_model, progress_callback=_trans_cb)
+                pipeline_ckpt.save_stage(current_job_id, "transcription", {"transcript": transcript, "words_list": words_list})
+                st.session_state["transcript"] = transcript
+                st.session_state["words_list"] = words_list
 
             p2.progress(100, f"✅ Speech analysis complete ({len(transcript)} segments, {len(words_list)} words)")
             st.success(f"Transcribed {len(transcript)} dialogue segments with word-level timestamps.")
@@ -588,21 +695,92 @@ with tab_main:
             st.error(f"Step 2 failed: {e}")
             st.stop()
         finally:
+            clear_audio_cache()
             release_gpu_memory()
 
         # STEP 3: Visual Object Detection (YOLO nano)
         st.subheader("Step 3/5 · Visual Object Detection & Motion Analysis (YOLO)")
-        p3 = st.progress(0, "Starting YOLO inference on GPU...")
+        p3 = st.progress(0, "Checking visual analysis checkpoint...")
 
         try:
-            def _yolo_cb(pct, msg):
-                p3.progress(int(pct), msg)
+            if not force_restart_pipeline and pipeline_ckpt.is_stage_completed(current_job_id, "visual_analysis"):
+                p3.progress(50, "Restoring visual analysis & facecam summary from checkpoint...")
+                v_data = pipeline_ckpt.load_stage(current_job_id, "visual_analysis") or {}
+                visual_scores = v_data.get("visual_scores", [])
+                facecam_summary = v_data.get("facecam_summary", {"available": False})
+                st.session_state["visual_scores"] = visual_scores
+                st.session_state["facecam_summary"] = facecam_summary
+                p3.progress(100, f"✅ Restored {len(visual_scores)} seconds of visual analysis from checkpoint")
+                st.caption(f"⚡ Loaded {len(visual_scores)} visual frames from checkpoint.")
+            else:
+                def _yolo_cb(pct, msg):
+                    p3.progress(int(pct), msg)
 
-            visual_scores = analyze_visuals(video_path, progress_callback=_yolo_cb)
-            st.session_state["visual_scores"] = visual_scores
+                cur_dur = video_duration_seconds
+                if not cur_dur or cur_dur <= 0:
+                    try:
+                        cur_dur = float(probe_video(video_path).get("duration", 0.0) or 0.0)
+                    except Exception:
+                        cur_dur = 0.0
 
-            p3.progress(100, f"✅ Processed {len(visual_scores)} seconds of visual gameplay")
+                v_segments = plan_video_segments(cur_dur or 0.0, segment_target_sec=1800.0, boundary_overlap_sec=30.0)
+                if len(v_segments) > 1:
+                    logger.info("Processing visual analysis across %d logical segments (%.1fs total)", len(v_segments), cur_dur)
+                    visual_scores = []
+                    seen_seconds = set()
+                    for s_idx, seg in enumerate(v_segments):
+                        seg_s = seg["start_sec"]
+                        seg_d = seg["duration"]
+                        p3.progress(
+                            int((s_idx / len(v_segments)) * 100),
+                            f"Visual analysis segment {s_idx+1}/{len(v_segments)} ({int(seg_s/60)}m - {int((seg_s+seg_d)/60)}m)...",
+                        )
+                        seg_scores = analyze_visuals(
+                            video_path,
+                            progress_callback=None,
+                            detect_facecam=enable_facecam_split,
+                            start_sec=seg_s,
+                            duration_sec=seg_d,
+                        )
+                        for sc in seg_scores:
+                            sec = sc.get("second", 0)
+                            if sec not in seen_seconds:
+                                seen_seconds.add(sec)
+                                visual_scores.append(sc)
+                    visual_scores.sort(key=lambda x: x.get("second", 0))
+                else:
+                    visual_scores = analyze_visuals(
+                        video_path, progress_callback=_yolo_cb,
+                        detect_facecam=enable_facecam_split,
+                    )
+                st.session_state["visual_scores"] = visual_scores
+
+                p3.progress(90, "Summarizing facecam presence across stream...")
+                if enable_facecam_split:
+                    source_info = probe_video(video_path)
+                    facecam_summary = summarize_facecam(
+                        visual_scores, int(source_info.get("width", 0)), int(source_info.get("height", 0))
+                    )
+                else:
+                    facecam_summary = {"available": False, "region": None, "presence": [], "reaction": []}
+
+                st.session_state["facecam_summary"] = facecam_summary
+                pipeline_ckpt.save_stage(current_job_id, "visual_analysis", {
+                    "visual_scores": visual_scores,
+                    "facecam_summary": facecam_summary,
+                })
+                p3.progress(100, f"✅ Processed {len(visual_scores)} seconds of visual gameplay")
+
             st.success(f"YOLO detection & motion tracking complete across {len(visual_scores)} seconds.")
+            if enable_facecam_split and facecam_summary.get("available"):
+                st.info(
+                    f"Facecam detected: {facecam_summary.get('observations', 0)} persistent samples "
+                    f"({facecam_summary.get('coverage', 0):.1%} of analyzed seconds)."
+                )
+            elif enable_facecam_split:
+                st.warning("No persistent inset facecam was detected. This run will use standard layouts.")
+            else:
+                st.info("ℹ️ Standard gameplay layouts will be used (Facecam split-screen disabled).")
         except Exception as e:
             st.error(f"Step 3 failed: {e}")
             st.stop()
@@ -611,75 +789,235 @@ with tab_main:
 
         # STEP 4: GTA Event Classification & AI Title/Metadata Generation
         st.subheader("Step 4/5 · GTA Event Classification, Highlight Scoring & AI Titles")
-        p4 = st.progress(0, "Classifying GTA gameplay events...")
+        p4 = st.progress(0, "Checking candidate selection checkpoint...")
 
         try:
-            events = classify_events(energy_scores, visual_scores, transcript)
+            if not force_restart_pipeline and pipeline_ckpt.is_stage_completed(current_job_id, "candidate_selection"):
+                p4.progress(50, "Restoring candidate curation & titles from disk checkpoint...")
+                c_data = pipeline_ckpt.load_stage(current_job_id, "candidate_selection") or {}
+                highlights = c_data.get("highlights", [])
+                rank_res = c_data.get("rank_res", {})
+                st.session_state["highlights"] = highlights
+                st.session_state["phase5_rank_res"] = rank_res
+                p4.progress(100, f"✅ Restored {len(highlights)} ranked highlights from checkpoint")
+                st.caption(f"⚡ Loaded {len(highlights)} curated clips from checkpoint.")
+            else:
+                p4.progress(10, "Classifying GTA gameplay events...")
+                events = classify_events(energy_scores, visual_scores, transcript)
 
-            p4.progress(25, "Computing multi-factor highlight scores...")
-            per_sec_scores = compute_per_second_scores(
-                energy_scores, visual_scores, transcript, events
-            )
+                p4.progress(25, "Computing multi-factor highlight scores...")
+                per_sec_scores = compute_per_second_scores(
+                    energy_scores, visual_scores, transcript, events
+                )
 
-            p4.progress(45, f"Selecting top {clip_count} highlights ({content_style} style, {clip_min_dur}–{clip_max_dur}s)...")
-            highlights = select_highlights(
-                per_sec_scores,
-                event_classification=events,
-                top_k=clip_count,
-                min_dur=clip_min_dur,
-                max_dur=clip_max_dur,
-                style=content_style,
-            )
+                # ── PHASE 5: CANDIDATE POOL GENERATION & INTELLIGENT RANKING ──
+                presence = facecam_summary.get("presence", []) if (enable_facecam_split and facecam_summary.get("available")) else []
+                reaction = facecam_summary.get("reaction", []) if (enable_facecam_split and facecam_summary.get("available")) else []
+                facecam_scores = None
+                if presence and reaction:
+                    facecam_scores = [
+                        (0.58 * float(reaction[i]) + 0.27 * float(per_sec_scores[i])
+                         + 0.15 * min(100.0, float(energy_scores[i].get("spike", 0)) * 5.0))
+                        if i < len(presence) and presence[i] and i < len(per_sec_scores) and i < len(energy_scores)
+                        else 0.0
+                        for i in range(min(len(presence), len(per_sec_scores), len(energy_scores)))
+                    ]
 
-            if not highlights:
-                st.warning("No highlight windows passed the minimum score threshold. Try a longer video or lower duration.")
-                st.stop()
+                # 1. Generate diverse candidate pool without arbitrary score suppression
+                candidate_pool = []
+                seen_windows = set()
+                pool_k = min(config.CLIP_TOP_K_MAX, max(40, clip_count * 6))
 
-            p4.progress(65, "Generating viral titles, hooks & platform metadata with Ollama...")
-            for idx, h in enumerate(highlights):
-                snippet = " ".join(
-                    s["text"] for s in transcript
-                    if s["end"] >= h["start"] and s["start"] <= h["end"]
-                ).strip()
-                h["transcript_snippet"] = snippet
+                # (A) General candidates across timeline
+                gen_cands = select_highlights(
+                    per_sec_scores,
+                    event_classification=events,
+                    top_k=pool_k,
+                    min_dur=clip_min_dur,
+                    max_dur=clip_max_dur,
+                    style=content_style,
+                    min_score=10.0,
+                )
+                for c in gen_cands:
+                    key = (round(c["start"], 1), round(c["end"], 1))
+                    if key not in seen_windows:
+                        seen_windows.add(key)
+                        candidate_pool.append(c)
 
-                if h.get("category") == "scenic" and not snippet:
-                    h["alt_titles"] = ["Take In This GTA View", "A Quiet Look at GTA's World", "GTA's World in Its Best Light"]
-                    h["selected_title"] = h["alt_titles"][0]
-                    h["alt_hooks"] = ["Take a second to look at this view", "A calmer moment in the GTA world", "Here is a scenic moment from the game"]
-                    h["hook"] = h["alt_hooks"][0]
-                    h["hashtags"] = ["#GTA", "#GTAGameplay", "#GamingClips", "#GameWorld"]
-                    h.update({
-                        "yt_description": "A scenic showcase moment from GTA gameplay.\n\n#GTA #GTAGameplay #GamingClips",
-                        "ig_description": "A scenic moment from the GTA world 🎮\n\n#GTA #GTAGameplay #GamingClips",
-                        "tt_description": "A quiet look at the GTA game world 🎮\n#GTA #GTAGameplay #GamingClips",
-                    })
-                elif h.get("category") == "unknown" and not snippet:
-                    # The current local models cannot describe silent visuals.
-                    # Keep metadata factual instead of inventing a chase/crash.
-                    h["alt_titles"] = ["A GTA Moment Worth Replaying",
-                                        "Watch This GTA Scene Unfold",
-                                        "A Moment From This GTA Session"]
-                    h["selected_title"] = h["alt_titles"][0]
-                    h["alt_hooks"] = ["Watch this moment unfold",
-                                      "Here is a moment from the session",
-                                      "Take a closer look at this scene"]
-                    h["hook"] = h["alt_hooks"][0]
-                    h["hashtags"] = ["#GTA", "#GTAGameplay", "#GamingClips"]
-                    h.update({
-                        "yt_description": "A moment from this GTA session. What stood out to you?\n\n#GTA #GTAGameplay #GamingClips",
-                        "ig_description": "A moment from this GTA session 🎮 Which detail caught your eye?\n\n#GTA #GTAGameplay #GamingClips",
-                        "tt_description": "One moment from the session 🎮 What did you notice?\n#GTA #GTAGameplay #GamingClips",
-                    })
-                else:
-                    h["alt_titles"] = generate_titles(h, style=content_style.lower())
-                    h["selected_title"] = h["alt_titles"][0] if h["alt_titles"] else f"GTA Highlight {idx+1}"
-                    h["alt_hooks"] = generate_hooks(h, style=content_style.lower())
-                    h["hook"] = h["alt_hooks"][0] if h["alt_hooks"] else ""
-                    h.update(generate_descriptions(h, title=h["selected_title"], style=content_style.lower()))
-                    h["hashtags"] = generate_hashtags(h, snippet=snippet)
+                # (B) Facecam-targeted candidates (if facecam detected in source)
+                if enable_facecam_split and facecam_summary.get("available") and facecam_scores:
+                    fc_cands = select_highlights(
+                        per_sec_scores,
+                        event_classification=events,
+                        top_k=pool_k,
+                        min_dur=clip_min_dur,
+                        max_dur=clip_max_dur,
+                        style=content_style,
+                        facecam_scores=facecam_scores,
+                        facecam_presence=presence,
+                        require_facecam=True,
+                        min_facecam_score=8.0,
+                        min_facecam_coverage=0.45,
+                        min_score=10.0,
+                    )
+                    for c in fc_cands:
+                        key = (round(c["start"], 1), round(c["end"], 1))
+                        if key not in seen_windows:
+                            seen_windows.add(key)
+                            candidate_pool.append(c)
 
-                p4.progress(65 + int(30 * (idx + 1) / len(highlights)), f"Processed metadata for Clip {idx+1}/{len(highlights)}")
+                # 2. Enrich candidates with facecam validation & cross-modal signals
+                for c in candidate_pool:
+                    c_start = int(c["start"])
+                    c_end = int(c["end"])
+                    is_facecam_valid = False
+                    if enable_facecam_split and facecam_summary.get("available") and presence:
+                        sub_p = presence[c_start:min(c_end, len(presence))]
+                        cov = (sum(1 for x in sub_p if x) / max(1, len(sub_p))) if sub_p else 0.0
+                        sub_fs = facecam_scores[c_start:min(c_end, len(facecam_scores))] if facecam_scores else []
+                        avg_fs = (sum(float(x) for x in sub_fs) / max(1, len(sub_fs))) if sub_fs else 0.0
+                        c["facecam_coverage"] = round(cov, 2)
+                        c["facecam_score"] = round(avg_fs, 2)
+                        if cov >= 0.40 and avg_fs >= 8.0:
+                            is_facecam_valid = True
+                    else:
+                        c["facecam_coverage"] = 0.0
+                        c["facecam_score"] = 0.0
+
+                    c["facecam_available"] = is_facecam_valid
+                    c["layout_type"] = "facecam_split" if is_facecam_valid else "standard"
+
+                    # Enrich with gameplay and reaction events if not already structured
+                    relevant_events = events[c_start:min(c_end, len(events))]
+                    labels = [lbl for e in relevant_events for lbl in e.get("events", [])]
+                    if labels and not c.get("gameplay_event"):
+                        c["gameplay_event"] = {
+                            "category": labels[0],
+                            "intensity": float(c.get("score", 60.0)),
+                            "confidence": float(c.get("confidence", 0.7)),
+                            "timestamp": float(c.get("peak_second", c["start"] + (c["end"] - c["start"]) * 0.35)),
+                        }
+                    if is_facecam_valid and not c.get("reaction_event"):
+                        c["reaction_event"] = {
+                            "category": "streamer_reaction" if c["facecam_score"] < 25.0 else "streamer_hype",
+                            "intensity": float(c["facecam_score"]),
+                            "confidence": float(c["facecam_coverage"]),
+                            "timestamp": float(c.get("peak_second", c["start"] + (c["end"] - c["start"]) * 0.5)),
+                        }
+
+                # 3. Cross-Segment Candidate Deduplication & Phase 5 ClipRanker
+                candidate_pool = deduplicate_cross_segment_candidates(candidate_pool, iou_threshold=0.40)
+                p4.progress(45, f"Evaluating candidate pool ({len(candidate_pool)} clips) with Unified Quality Scorer...")
+                min_quality = getattr(config, "MIN_QUALITY_SCORE", 55.0)
+                target_ratio = (facecam_quota_percent / 100.0) if enable_facecam_split else 0.0
+                ranker = ClipRanker(
+                    min_quality_score=min_quality,
+                    target_facecam_ratio=target_ratio,
+                )
+
+                rank_res = ranker.rank_and_curate_clips(
+                    candidate_clips=candidate_pool,
+                    top_k=clip_count,
+                    whisper_segments=transcript,
+                    audio_energy=energy_scores,
+                    visual_scores=visual_scores,
+                    facecam_available_in_source=bool(enable_facecam_split and facecam_summary.get("available")),
+                )
+                st.session_state["phase5_rank_res"] = rank_res
+
+                # Map ranked clips into highlights maintaining all downstream contracts
+                ranked_clips = rank_res["ranked_clips"]
+                highlights = []
+                for rank_idx, c in enumerate(ranked_clips):
+                    h = dict(c)
+                    h["rank"] = rank_idx + 1
+                    h["unified_score"] = c.get("unified_score", c.get("score", 0.0))
+                    h["score"] = h["unified_score"]
+                    h["duration"] = h["end"] - h["start"]
+                    h["reason"] = c.get("explanation") or c.get("reason", "")
+                    h["score_factors"] = c.get("quality_evaluation", {}).get("factor_scores", c.get("score_factors", {}))
+                    h["factor_scores"] = h["score_factors"]
+                    highlights.append(h)
+
+                if not highlights:
+                    st.error("⚠️ No candidate clips passed the current quality gate.")
+                    diag = generate_empty_output_diagnostic(
+                        rank_result=rank_res,
+                        total_candidates=len(candidate_pool),
+                        total_duration_sec=float(len(visual_scores)),
+                        min_quality_score=min_quality,
+                        facecam_summary=facecam_summary,
+                    )
+                    pipeline_ckpt.save_stage(current_job_id, "empty_output_diagnostic", diag)
+
+                    with st.expander("🔍 Deep Quality Diagnostic & Why No Clips Were Produced", expanded=True):
+                        d_col1, d_col2, d_col3 = st.columns(3)
+                        d_col1.metric("Evaluated Candidates", diag["total_candidates"])
+                        d_col2.metric("Min Quality Threshold", f"{diag['min_quality_threshold']}/100")
+                        d_col3.metric("Top Candidate Score", f"{diag['score_stats'].get('max', 0)}/100")
+
+                        st.markdown("##### 📊 Rejection Reason Breakdown")
+                        for cat, count in diag.get("rejection_tally", {}).items():
+                            st.write(f"- **{cat}:** {count} candidates")
+
+                        if diag.get("near_misses"):
+                            st.markdown("##### 🎯 Highest-Scoring Near-Miss Candidates")
+                            for nm in diag["near_misses"]:
+                                st.write(f"• **[{nm['time_range']}]** — Score: **{nm['score']}/100** (Reasons: {'; '.join(nm['reasons']) or 'Below threshold'})")
+
+                        st.markdown("##### 💡 Actionable Next Steps")
+                        for rec in diag.get("actionable_recommendations", []):
+                            st.info(f"👉 {rec}")
+                    st.stop()
+
+                p4.progress(65, "Generating viral titles, hooks & platform metadata with Ollama...")
+                for idx, h in enumerate(highlights):
+                    snippet = " ".join(
+                        s["text"] for s in transcript
+                        if s["end"] >= h["start"] and s["start"] <= h["end"]
+                    ).strip()
+                    h["transcript_snippet"] = snippet
+
+                    if h.get("category") == "scenic" and not snippet:
+                        h["alt_titles"] = ["Take In This GTA View", "A Quiet Look at GTA's World", "GTA's World in Its Best Light"]
+                        h["selected_title"] = h["alt_titles"][0]
+                        h["alt_hooks"] = ["Take a second to look at this view", "A calmer moment in the GTA world", "Here is a scenic moment from the game"]
+                        h["hook"] = h["alt_hooks"][0]
+                        h["hashtags"] = ["#GTA", "#GTAGameplay", "#GamingClips", "#GameWorld"]
+                        h.update({
+                            "yt_description": "A scenic showcase moment from GTA gameplay.\n\n#GTA #GTAGameplay #GamingClips",
+                            "ig_description": "A scenic moment from the GTA world 🎮\n\n#GTA #GTAGameplay #GamingClips",
+                            "tt_description": "A quiet look at the GTA game world 🎮\n#GTA #GTAGameplay #GamingClips",
+                        })
+                    elif h.get("category") == "unknown" and not snippet:
+                        h["alt_titles"] = ["A GTA Moment Worth Replaying",
+                                            "Watch This GTA Scene Unfold",
+                                            "A Moment From This GTA Session"]
+                        h["selected_title"] = h["alt_titles"][0]
+                        h["alt_hooks"] = ["Watch this moment unfold",
+                                          "Here is a moment from the session",
+                                          "Take a closer look at this scene"]
+                        h["hook"] = h["alt_hooks"][0]
+                        h["hashtags"] = ["#GTA", "#GTAGameplay", "#GamingClips"]
+                        h.update({
+                            "yt_description": "A moment from this GTA session. What stood out to you?\n\n#GTA #GTAGameplay #GamingClips",
+                            "ig_description": "A moment from this GTA session 🎮 Which detail caught your eye?\n\n#GTA #GTAGameplay #GamingClips",
+                            "tt_description": "One moment from the session 🎮 What did you notice?\n#GTA #GTAGameplay #GamingClips",
+                        })
+                    else:
+                        h["alt_titles"] = generate_titles(h, style=content_style.lower())
+                        h["selected_title"] = h["alt_titles"][0] if h["alt_titles"] else f"GTA Highlight {idx+1}"
+                        h["alt_hooks"] = generate_hooks(h, style=content_style.lower())
+                        h["hook"] = h["alt_hooks"][0] if h["alt_hooks"] else ""
+                        h.update(generate_descriptions(h, title=h["selected_title"], style=content_style.lower()))
+                        h["hashtags"] = generate_hashtags(h, snippet=snippet)
+
+                    p4.progress(65 + int(30 * (idx + 1) / len(highlights)), f"Processed metadata for Clip {idx+1}/{len(highlights)}")
+
+                pipeline_ckpt.save_stage(current_job_id, "candidate_selection", {
+                    "highlights": highlights,
+                    "rank_res": rank_res,
+                })
 
             st.session_state["highlights"] = highlights
             p4.progress(100, f"✅ Scored and titled {len(highlights)} clips")
@@ -701,10 +1039,37 @@ with tab_main:
             "face" if is_vertical and face_track_vertical else "center"
         )
 
+        already_rendered = pipeline_ckpt.get_rendered_clips(current_job_id) if not force_restart_pipeline else []
+        rendered_map = {c.get("clip_index"): c for c in already_rendered}
+
+        fc_summary = facecam_summary if 'facecam_summary' in locals() else (st.session_state.get("facecam_summary") or {})
+        facecam_quota = int(math.ceil(len(highlights) * (facecam_quota_percent / 100.0))) if (enable_facecam_split and fc_summary.get("available")) else 0
+        facecam_highlights = [h for h in highlights if h.get("layout_type") == "facecam_split"]
+
         final_clips = []
         for i, h in enumerate(highlights):
             clip_title_safe = re.sub(r"[^a-zA-Z0-9_-]", "_", h["selected_title"])[:30].strip("_")
             clip_id = f"clip_{i+1:02d}_{clip_title_safe}"
+
+            # Check if this clip was already exported and valid on disk
+            if i in rendered_map and os.path.isfile(rendered_map[i].get("output_path", "")):
+                p5.progress(
+                    int(((i + 1) / len(highlights)) * 95),
+                    f"Restoring clip {i+1}/{len(highlights)} from checkpoint...",
+                )
+                restored_path = rendered_map[i]["output_path"]
+                meta = rendered_map[i].get("metadata") or {}
+                pkg = {
+                    "success": True,
+                    "clip_path": restored_path,
+                    "output_path": restored_path,
+                    "clip_dir": os.path.dirname(restored_path),
+                    "thumbnail_path": meta.get("thumbnail_path", ""),
+                }
+                qc = {"passed": meta.get("qc_passed", True), "issues": meta.get("qc_issues", [])}
+                final_clips.append({**h, **pkg, "metadata": meta, "qc": qc})
+                st.caption(f"⚡ Restored Clip {i+1} (`{os.path.basename(restored_path)}`) from checkpoint.")
+                continue
 
             p5.progress(
                 int((i / len(highlights)) * 90),
@@ -715,6 +1080,16 @@ with tab_main:
             ass_content = None
             srt_content = None
             hook_banner_text = (h.get("hook") or h.get("selected_title") or "").strip()
+            is_facecam_clip = h.get("layout_type") == "facecam_split"
+            facecam_layout = build_facecam_layout(
+                visual_scores, h["start"], h["end"], src_w, src_h, facecam_summary,
+                facecam_percent=facecam_panel_percent,
+                headline_text=(hook_banner_text if facecam_headline_enabled else "") if is_facecam_clip else "",
+                branding_text=facecam_branding if is_facecam_clip else "",
+            ) if is_facecam_clip else None
+            if is_facecam_clip and facecam_layout is None:
+                st.warning(f"Clip {i+1} lost face tracking before render; skipping it instead of exporting a false facecam layout.")
+                continue
             if (burn_captions and transcript) or (burn_hook_header and hook_banner_text):
                 ass_content = generate_clip_ass(
                     words_list=words_list or [],
@@ -727,7 +1102,7 @@ with tab_main:
                     dynamic_highlight=dynamic_highlight,
                     caption_style=caption_style,
                     hook_text=hook_banner_text,
-                    burn_hook=burn_hook_header,
+                    burn_hook=(burn_hook_header and not is_facecam_clip),
                     add_emojis=enable_caption_emojis,
                 )
             if burn_captions and transcript:
@@ -746,6 +1121,10 @@ with tab_main:
                 "duration":         h["end"] - h["start"],
                 "category":         h.get("category", content_style.lower()),
                 "score":            h.get("score", 0.0),
+                "rank":             h.get("rank", i + 1),
+                "unified_score":    h.get("unified_score", h.get("score", 0.0)),
+                "quality_evaluation": h.get("quality_evaluation", {}),
+                "factor_scores":    h.get("factor_scores", h.get("score_factors", {})),
                 "highlight_reason": h.get("reason", ""),
                 "score_factors":    h.get("score_factors", {}),
                 "peak_second":      h.get("peak_second"),
@@ -764,11 +1143,16 @@ with tab_main:
                 "caption_position": caption_position,
                 "caption_template": caption_template_name,
                 "caption_style":    caption_style,
-                "burn_hook":        burn_hook_header,
+                "burn_hook":        burn_hook_header and not is_facecam_clip,
                 "add_emojis":       enable_caption_emojis,
                 "export_settings":  export_settings,
                 "crop_style":       crop_style_choice,
-                "remove_dead_air":  remove_dead_air,
+                "remove_dead_air":  remove_dead_air and not is_facecam_clip,
+                "layout_type":      "facecam_split" if is_facecam_clip else "standard",
+                "facecam_score":    h.get("facecam_score", 0.0),
+                "facecam_layout":   facecam_layout,
+                "facecam_quota":    facecam_quota,
+                "facecam_quota_met": len(facecam_highlights) >= facecam_quota,
             }
 
             pkg = build_clip_package(
@@ -783,8 +1167,9 @@ with tab_main:
                 src_width=src_w,
                 src_height=src_h,
                 metadata=metadata_dict,
-                remove_dead_air=remove_dead_air,
+                remove_dead_air=(remove_dead_air and not is_facecam_clip),
                 export_settings=export_settings,
+                facecam_layout=facecam_layout,
             )
 
             if not pkg["success"]:
@@ -798,7 +1183,11 @@ with tab_main:
                 h["end"],
                 h.get("score", 0.0),
                 min_score=5.0,
+                facecam_split=is_facecam_clip,
             )
+            if is_facecam_clip and not qc["passed"]:
+                st.warning(f"Facecam clip #{i+1} failed layout QC and was not included: " + "; ".join(qc["issues"]))
+                continue
             metadata_dict["qc_passed"] = qc["passed"]
             metadata_dict["qc_issues"] = qc["issues"]
             metadata_dict["clip_path"] = pkg["clip_path"]
@@ -807,9 +1196,23 @@ with tab_main:
             # Save in SQLite DB
             save_clip_metadata(metadata_dict)
 
+            # Record rendered clip immediately in disk checkpoint for instant resume
+            pipeline_ckpt.save_rendered_clip(current_job_id, i, clip_id, pkg["clip_path"], metadata_dict)
+
             final_clips.append({**h, **pkg, "metadata": metadata_dict, "qc": qc})
 
+        pipeline_ckpt.save_stage(current_job_id, "clip_export", {"final_clips_count": len(final_clips)})
+
         st.session_state["final_clips"] = final_clips
+        rendered_facecam_count = sum(
+            1 for clip in final_clips
+            if (clip.get("metadata") or {}).get("layout_type") == "facecam_split"
+        )
+        if enable_facecam_split and facecam_quota > 0 and rendered_facecam_count < facecam_quota:
+            st.warning(
+                f"Facecam quota after export/QC: {rendered_facecam_count} of {facecam_quota} requested clips passed. "
+                "Some selected split-screen clips could not be exported or did not pass layout checks."
+            )
         p5.progress(100, f"✅ Exported {len(final_clips)} ready-to-post clips!")
         st.success(f"🎉 All {len(final_clips)} clips generated successfully with captions, thumbnails, and metadata!")
 
@@ -819,7 +1222,43 @@ with tab_main:
         st.markdown("---")
         st.header(f"📦 Generated Clips ({len(final_clips)})")
 
-        for idx, clip in enumerate(final_clips):
+        filter_col1, filter_col2, filter_col3 = st.columns([1.3, 1.2, 1])
+        with filter_col1:
+            layout_filter = st.radio(
+                "Filter Layout:",
+                ["All Clips", "Facecam Split-Screen Only", "Standard Gameplay Only"],
+                horizontal=True,
+                key="results_layout_filter",
+            )
+        with filter_col2:
+            sort_by = st.selectbox(
+                "Sort Clips by:",
+                ["Quality Rank (Default)", "Score (High to Low)", "Chronological (Time)", "Longest Duration"],
+                index=0,
+                key="results_sort_by",
+            )
+        with filter_col3:
+            only_passed_qc = st.checkbox("Show only passed QC", value=False, key="results_only_passed_qc")
+
+        displayed_clips = list(final_clips)
+        if layout_filter == "Facecam Split-Screen Only":
+            displayed_clips = [c for c in displayed_clips if (c.get("metadata") or {}).get("layout_type") == "facecam_split" or c.get("layout_type") == "facecam_split"]
+        elif layout_filter == "Standard Gameplay Only":
+            displayed_clips = [c for c in displayed_clips if (c.get("metadata") or {}).get("layout_type") != "facecam_split" and c.get("layout_type") != "facecam_split"]
+
+        if only_passed_qc:
+            displayed_clips = [c for c in displayed_clips if (c.get("qc") or {}).get("passed", True)]
+
+        if sort_by == "Score (High to Low)":
+            displayed_clips.sort(key=lambda c: float((c.get("metadata") or {}).get("score", c.get("unified_score", c.get("score", 0.0)))), reverse=True)
+        elif sort_by == "Chronological (Time)":
+            displayed_clips.sort(key=lambda c: float((c.get("metadata") or {}).get("start_sec", c.get("start", 0.0))))
+        elif sort_by == "Longest Duration":
+            displayed_clips.sort(key=lambda c: float((c.get("metadata") or {}).get("duration", c.get("end", 0.0) - c.get("start", 0.0))), reverse=True)
+
+        st.caption(f"Showing **{len(displayed_clips)}** of **{len(final_clips)}** generated clips.")
+
+        for idx, clip in enumerate(displayed_clips):
             meta = clip.get("metadata", {})
             qc = clip.get("qc", {})
             passed = qc.get("passed", True)
@@ -842,17 +1281,27 @@ with tab_main:
                         st.image(th, caption="Suggested Cover Thumbnail", use_container_width=True)
 
                 with col_details:
-                    # Retention & Hook Metrics
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Virality Score", f"{score:.1f}")
-                    m2.metric("3s Hook Strength", f"{meta.get('hook_score', 0):.0f}%")
+                    # Phase 5 Unified Quality, Rank & Retention Metrics
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Unified Score", f"{score:.1f}/100")
+                    m2.metric("Rank", f"#{meta.get('rank', idx+1)}")
+                    m3.metric("3s Hook Strength", f"{meta.get('hook_score', 0):.0f}%")
                     silence_rem = meta.get("silence_removed_sec", 0.0)
-                    m3.metric("Dead Air Cut", f"{silence_rem:.1f}s" if silence_rem > 0 else "Tight")
+                    m4.metric("Dead Air Cut", f"{silence_rem:.1f}s" if silence_rem > 0 else "Tight")
                     if meta.get("highlight_reason"):
-                        st.caption(meta["highlight_reason"])
-                    if meta.get("score_factors"):
-                        with st.expander("Why this moment was selected"):
-                            st.json(meta["score_factors"])
+                        st.caption(f"**Selection Rationale:** {meta['highlight_reason']}")
+                    factors = meta.get("factor_scores") or meta.get("score_factors")
+                    if factors:
+                        with st.expander("📊 10-Factor Quality Score Breakdown"):
+                            f_cols = st.columns(2)
+                            f_items = list(factors.items())
+                            mid = (len(f_items) + 1) // 2
+                            with f_cols[0]:
+                                for k, v in f_items[:mid]:
+                                    st.write(f"• **{k.replace('_', ' ').title()}**: {v}")
+                            with f_cols[1]:
+                                for k, v in f_items[mid:]:
+                                    st.write(f"• **{k.replace('_', ' ').title()}**: {v}")
 
                     with st.expander("Transcript and clip trim"):
                         duration_info = probe_video(meta.get("source_path", "")) if meta.get("source_path") else {}
@@ -919,11 +1368,13 @@ with tab_main:
                                     metadata=edited_meta,
                                     remove_dead_air=bool(edited_meta.get("remove_dead_air", False)),
                                     export_settings=export_opts,
+                                    facecam_layout=edited_meta.get("facecam_layout"),
                                 )
                                 if edited_pkg.get("success"):
                                     edited_qc = evaluate_clip(
                                         edited_pkg["clip_path"], clip_start_edit, clip_end_edit,
                                         edited_meta.get("score", 0), min_score=5.0,
+                                        facecam_split=edited_meta.get("layout_type") == "facecam_split",
                                     )
                                     edited_meta.update({"clip_path": edited_pkg["clip_path"],
                                                         "thumbnail_path": edited_pkg.get("thumbnail_path", ""),
@@ -931,9 +1382,16 @@ with tab_main:
                                     save_clip_metadata(edited_meta)
                                     updated_clip = {**clip, **edited_pkg, "metadata": edited_meta, "qc": edited_qc}
                                     current_clips = list(st.session_state.get("final_clips", []))
-                                    if idx < len(current_clips):
+                                    match_idx = None
+                                    for c_i, c_val in enumerate(current_clips):
+                                        if c_val.get("clip_path") == clip.get("clip_path"):
+                                            match_idx = c_i
+                                            break
+                                    if match_idx is not None:
+                                        current_clips[match_idx] = updated_clip
+                                    elif idx < len(current_clips):
                                         current_clips[idx] = updated_clip
-                                        st.session_state["final_clips"] = current_clips
+                                    st.session_state["final_clips"] = current_clips
                                     st.success("Updated trim rendered and checked.")
                                     st.rerun()
                                 else:

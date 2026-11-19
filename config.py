@@ -58,8 +58,9 @@ CLIP_MAX_DURATION = 180   # seconds
 CLIP_VIRAL_MIN_DURATION = 30  # seconds (sweet spot for Reels/Shorts)
 CLIP_VIRAL_MAX_DURATION = 45  # seconds
 CLIP_DEFAULT_DURATION = 35    # default 35s (within 30-45s viral range)
-CLIP_DEFAULT_COUNT = 5        # number of clips to generate
-CLIP_TOP_K_MAX = 20           # hard cap on clips per run
+CLIP_DEFAULT_COUNT_PER_HOUR = 10  # user-selectable target rate for long sources
+CLIP_DEFAULT_COUNT = CLIP_DEFAULT_COUNT_PER_HOUR  # legacy config name
+CLIP_TOP_K_MAX = 100          # hard cap, sufficient for 10 clips/hour on long videos
 
 # ─────────────────────────── DEAD AIR & JUMP-CUTS ───────────────────────────
 REMOVE_DEAD_AIR_DEFAULT = False  # Keep natural dialogue pauses unless the user opts in.
@@ -162,3 +163,20 @@ GTA_EVENT_BONUS = {
 # ─────────────────────────── UPLOAD LIMIT ───────────────────────────
 # In MB (Streamlit config also set in .streamlit/config.toml)
 MAX_UPLOAD_MB = 51200   # 50 GB
+
+# ─────────────────────────── PHASE 4 DYNAMIC POLISH & LAYOUT ───────────────────────────
+DYNAMIC_LAYOUT_DEFAULT = "auto"              # auto | 50/50 | 40/60 | 60/40 | standard_vertical
+REACTION_ZOOM_ENABLED = True                 # Subtle zoom punch-in on high-arousal streamer moments
+REACTION_ZOOM_MAX_FACTOR = 0.12              # 12% subtle punch-in
+REACTION_ZOOM_MIN_CONFIDENCE = 0.65          # Only zoom on verified high-confidence reactions
+GAMEPLAY_ZOOM_ENABLED = True                 # Subtle 6% punch-in on gameplay triggers
+GAMEPLAY_ZOOM_MAX_FACTOR = 0.06
+DYNAMIC_HEADLINE_ENABLED = True              # Context-aware animated headline
+BRANDING_WATERMARK_TEXT = ""                 # Configurable channel name (e.g. "@Channel" or empty)
+BRANDING_WATERMARK_POSITION = "bottom_right" # bottom_right | bottom_left | top_right
+BRANDING_WATERMARK_OPACITY = 0.65            # Subtle non-intrusive watermark
+
+# ─────────────────────────── PHASE 5 UNIFIED QUALITY SCORING & RANKING ───────────────────────────
+MIN_QUALITY_SCORE = 55.0          # Minimum 0-100 score required to pass quality gating
+TARGET_FACECAM_RATIO = 0.50       # Target 50% facecam split-screen clips when valid footage exists
+NEAR_DUPLICATE_IOU_THRESH = 0.35  # Suppress candidates with temporal IoU > 0.35

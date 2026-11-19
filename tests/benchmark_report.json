@@ -1,0 +1,173 @@
+{
+  "environment": {
+    "opencv_version": "5.1.0",
+    "mediapipe_version": "1.2.3",
+    "model_asset": "face_landmarker.task (3.76 MB)",
+    "gpu": "NVIDIA GeForce RTX 3050 Laptop GPU (6GB VRAM)"
+  },
+  "continuous_benchmark": {
+    "haar": {
+      "detector": "OpenCV Haar Cascade",
+      "description": "Continuous Streamer Reaction (6s @ 30fps)",
+      "total_frames": 180,
+      "detected_frames": 180,
+      "detection_rate_pct": 100.0,
+      "mean_latency_ms": 11.68,
+      "median_latency_ms": 11.68,
+      "p95_latency_ms": 12.64,
+      "min_latency_ms": 10.43,
+      "max_latency_ms": 16.28,
+      "throughput_fps": 85.6,
+      "ram_delta_mb": 156.86,
+      "vram_allocated_mb": 0.0,
+      "jitter_raw": {
+        "mean_step": 9.95,
+        "step_variance": 1156.26,
+        "max_step": 137.88,
+        "sudden_jumps": 12
+      }
+    },
+    "mediapipe": {
+      "detector": "MediaPipe Face Landmarker",
+      "description": "Continuous Streamer Reaction (6s @ 30fps)",
+      "total_frames": 180,
+      "detected_frames": 180,
+      "detection_rate_pct": 100.0,
+      "mean_latency_ms": 7.75,
+      "median_latency_ms": 7.68,
+      "p95_latency_ms": 8.83,
+      "min_latency_ms": 7.05,
+      "max_latency_ms": 9.47,
+      "throughput_fps": 129.0,
+      "ram_delta_mb": 4.43,
+      "vram_allocated_mb": 0.0,
+      "jitter_raw": {
+        "mean_step": 0.53,
+        "step_variance": 0.28,
+        "max_step": 2.06,
+        "sudden_jumps": 0
+      }
+    }
+  },
+  "stills_comparison": [
+    {
+      "image": "facecam_t1800.jpg",
+      "resolution": "640x360",
+      "haar_detected": true,
+      "haar_faces": 1,
+      "mediapipe_detected": true,
+      "mediapipe_faces": 1,
+      "mediapipe_blendshapes": {
+        "smile": 0.0013,
+        "jaw_open": 0.0012,
+        "brow_up": 0.0001,
+        "num_landmarks": 478
+      }
+    },
+    {
+      "image": "facecam_sample.jpg",
+      "resolution": "1280x720",
+      "haar_detected": true,
+      "haar_faces": 6,
+      "mediapipe_detected": true,
+      "mediapipe_faces": 2,
+      "mediapipe_blendshapes": {
+        "smile": 0.7929,
+        "jaw_open": 0.0042,
+        "brow_up": 0.0006,
+        "num_landmarks": 478
+      }
+    },
+    {
+      "image": "facecam_source_sheet.jpg",
+      "resolution": "1280x720",
+      "haar_detected": true,
+      "haar_faces": 3,
+      "mediapipe_detected": true,
+      "mediapipe_faces": 1,
+      "mediapipe_blendshapes": {
+        "smile": 0.0002,
+        "jaw_open": 0.0005,
+        "brow_up": 0.0803,
+        "num_landmarks": 478
+      }
+    },
+    {
+      "image": "gamerfleet_streamer_active_1080p",
+      "resolution": "1920x1080",
+      "haar_detected": true,
+      "haar_faces": 5,
+      "mediapipe_detected": true,
+      "mediapipe_faces": 1,
+      "mediapipe_blendshapes": {
+        "smile": 0.0293,
+        "jaw_open": 0.0002,
+        "brow_up": 0.0904,
+        "num_landmarks": 478
+      }
+    },
+    {
+      "image": "gamerfleet_streamer_active_640x360",
+      "resolution": "640x360",
+      "haar_detected": true,
+      "haar_faces": 2,
+      "mediapipe_detected": true,
+      "mediapipe_faces": 1,
+      "mediapipe_blendshapes": {
+        "smile": 0.0959,
+        "jaw_open": 0.0,
+        "brow_up": 0.0779,
+        "num_landmarks": 478
+      }
+    },
+    {
+      "image": "gamerfleet_gameplay_scenery_1080p",
+      "resolution": "1920x1080",
+      "haar_detected": true,
+      "haar_faces": 4,
+      "mediapipe_detected": false,
+      "mediapipe_faces": 0,
+      "mediapipe_blendshapes": null
+    }
+  ],
+  "smoothing_evaluation": {
+    "ema_alpha_0.1": {
+      "alpha": 0.1,
+      "mean_step": 0.16,
+      "step_variance": 0.01,
+      "variance_reduction_pct": 96.43,
+      "sudden_jumps": 0
+    },
+    "ema_alpha_0.18": {
+      "alpha": 0.18,
+      "mean_step": 0.21,
+      "step_variance": 0.03,
+      "variance_reduction_pct": 89.29,
+      "sudden_jumps": 0
+    },
+    "ema_alpha_0.25": {
+      "alpha": 0.25,
+      "mean_step": 0.24,
+      "step_variance": 0.04,
+      "variance_reduction_pct": 85.71,
+      "sudden_jumps": 0
+    },
+    "ema_alpha_0.35": {
+      "alpha": 0.35,
+      "mean_step": 0.28,
+      "step_variance": 0.05,
+      "variance_reduction_pct": 82.14,
+      "sudden_jumps": 0
+    },
+    "adaptive_ema": {
+      "mean_step": 0.17,
+      "step_variance": 0.03,
+      "variance_reduction_pct": 89.29,
+      "sudden_jumps": 0
+    }
+  },
+  "fallback_resilience": {
+    "tested": true,
+    "passed": true
+  }
+}

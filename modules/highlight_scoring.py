@@ -100,7 +100,10 @@ def compute_per_second_scores(energy_buckets, visual_scores, transcript,
 
 def select_highlights(per_second_scores, event_classification=None, top_k=5,
                       window_sec=30, min_dur=None, max_dur=None, min_score=10.0,
-                      style="balanced", excluded_categories=None):
+                      style="balanced", excluded_categories=None,
+                      excluded_ranges=None, facecam_scores=None,
+                      facecam_presence=None, require_facecam=False,
+                      min_facecam_score=0.0, min_facecam_coverage=0.60):
     """Rank automatically generated windows around local activity peaks.
 
     The app must cut clips without asking the user to supply timestamps. This
@@ -116,6 +119,7 @@ def select_highlights(per_second_scores, event_classification=None, top_k=5,
     max_len = min(n, high)
     min_len = min(max_len, low)
     excluded = set(excluded_categories or [])
+    excluded_ranges = excluded_ranges or []
     baseline = sorted(per_second_scores)[int((n - 1) * 0.45)]
     active_cutoff = max(baseline + 2.0, sorted(per_second_scores)[int((n - 1) * 0.70)])
     # Evaluate the configured range in 5-second increments. Choosing only the
@@ -133,6 +137,9 @@ def select_highlights(per_second_scores, event_classification=None, top_k=5,
             starts.append(n - length)
         for start in starts:
             end = start + length
+            if any(start < float(r_end) and end > float(r_start)
+                   for r_start, r_end in excluded_ranges):
+                continue
             window = per_second_scores[start:end]
             mean_score = sum(window) / length
             peak = max(window)
@@ -164,6 +171,19 @@ def select_highlights(per_second_scores, event_classification=None, top_k=5,
             # A peak contributes, but cannot carry a mostly inactive window.
             quality_score = (0.58 * mean_score + 0.18 * peak + 14 * coverage +
                              0.55 * above_baseline)
+            face_score = 0.0
+            face_coverage = 0.0
+            if facecam_scores is not None and facecam_presence is not None:
+                fs = facecam_scores[start:min(end, len(facecam_scores))]
+                fp = facecam_presence[start:min(end, len(facecam_presence))]
+                face_score = sum(float(x) for x in fs) / max(1, len(fs))
+                face_coverage = sum(1 for x in fp if x) / max(1, len(fp))
+            if require_facecam:
+                if face_coverage < min_facecam_coverage or face_score < min_facecam_score:
+                    continue
+                # Keep gameplay/audio quality meaningful while prioritizing
+                # windows where the streamer's face shows a reaction.
+                quality_score = 0.42 * quality_score + 0.58 * face_score
             if quality_score < min_score:
                 continue
 
@@ -183,6 +203,9 @@ def select_highlights(per_second_scores, event_classification=None, top_k=5,
                                "confidence": round(confidence, 2),
                                "hook_score": hook_score,
                                "hook_type": hook_type,
+                               "facecam_score": round(face_score, 2),
+                               "facecam_coverage": round(face_coverage, 2),
+                               "layout_type": "facecam_split" if require_facecam else "standard",
                                "reason": f"Ranked with {hook_type} hook ({hook_score:.0f}%) and sustained action",
                                "score_factors": {"window_mean": round(mean_score, 2),
                                                  "quality_score": round(quality_score, 2),

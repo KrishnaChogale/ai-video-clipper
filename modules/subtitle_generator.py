@@ -217,6 +217,7 @@ def generate_clip_ass(
     burn_hook: bool = None,
     add_emojis: bool = None,
     hook_style: str = None,
+    facecam_split: bool = False,
 ) -> str:
     """
     Generate pixel-perfect ASS subtitles for viral shorts.
@@ -297,7 +298,12 @@ def generate_clip_ass(
             margin_v = 240   # Header safe zone
         else:  # Bottom
             alignment = 2
-            margin_v = config.CAPTION_SAFE_MARGIN_V_REELS  # 440px (Safe above Reels/Shorts bottom bar)
+            if facecam_split:
+                # Safe zone for split screen: upper area of gameplay panel, below the banner
+                # Leaves streamer face (top) and game HUD (bottom) completely clear
+                margin_v = 780
+            else:
+                margin_v = config.CAPTION_SAFE_MARGIN_V_REELS  # 440px (Safe above Reels/Shorts bottom bar)
 
         hook_fontsize = getattr(config, "HOOK_BANNER_FONT_SIZE_VERTICAL", 48)
         hook_margin_v = getattr(config, "HOOK_BANNER_MARGIN_V_VERTICAL", 260)
@@ -394,11 +400,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 else:
                     w_end = max(active_item["end"], w_start + 0.35)
 
-                # Format current line: active word highlighted, others in base white
+                # Format current line: active word kinetic pop & highlight, others in base white
                 line_parts = []
                 for k, w_text in enumerate(clean_words):
                     if k == j:
-                        line_parts.append(f"{{\\c{highlight_color}}}{w_text}{{\\c{base_color}}}")
+                        is_high_arousal = any(em in w_text for em in ["!", "?", "INSANE", "CRAZY", "CLUTCH", "DEAD", "WHAT", "GOD", "HYPE", "OMG", "BRO"])
+                        scale_tag = r"\fscx116\fscy116" if is_high_arousal else r"\fscx112\fscy112"
+                        active_color = "&H0037E6FF&" if (is_high_arousal and highlight_color == "&H0000FFFF&") else highlight_color
+                        line_parts.append(f"{{{scale_tag}\\c{active_color}}}{w_text}{{\\fscx100\\fscy100}}{{\\c{base_color}}}")
                     else:
                         line_parts.append(w_text)
 
